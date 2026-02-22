@@ -1,0 +1,6 @@
+[submodule "frontend"]
+	path = frontend
+	url = https://github.com/matt-stroman/board_third-party-lib_frontend.git
+[submodule "backend"]
+	path = backend
+	url = https://github.com/matt-stroman/board_third-party-lib_backend.git
