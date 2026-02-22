@@ -40,4 +40,11 @@ Frontend path /frontend
 
 ## Technologies and Architecture
 
-TBD
+See *docs/* folder.
+
+## Code Requirements
+
+- Prefer abstractions and interfaces for modular implementations that can easily be swapped out with dependency injection.
+- Unit tests must be written to public API/interface only. Never make assumptions based on implementation details or members/types that are not accessible.
+- New code will not be accepted without corresponding unit tests.
+- All non-private members and types must be clearly documented with applicable and appropriate tagging (e.g. XML docs for C#, Javadoc for JS, etc.)
