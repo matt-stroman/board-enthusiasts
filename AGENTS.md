@@ -25,11 +25,11 @@ Board has also not yet provided a monetization solution for third party develope
 
 ## Supplemental Documentation
 
-Board website: https://board.fun/
-Board User FAQ: https://board.fun/pages/support?hcUrl=%2Fen-US
-Board SDK Docs: https://docs.dev.board.fun/
-itch.io Creator FAQ: https://itch.io/docs/creators/faq
-Humble Bundle FAQ: https://support.humblebundle.com/hc/en-us/sections/200515154-Developer-FAQ
+- [Board website](https://board.fun/)
+- [Board User FAQ](https://board.fun/pages/support?hcUrl=%2Fen-US)
+- [Board SDK Docs](https://docs.dev.board.fun/)
+- [itch.io Creator FAQ](https://itch.io/docs/creators/faq)
+- [Humble Bundle Developer FAQ](https://support.humblebundle.com/hc/en-us/sections/200515154-Developer-FAQ)
 
 ## Repository Structure
 
@@ -40,11 +40,15 @@ Frontend path /frontend
 
 ## Technologies and Architecture
 
-See *docs/* folder.
+See the [docs folder](docs/).
 
-## Code Requirements
+## Coding Standard
 
 - Prefer abstractions and interfaces for modular implementations that can easily be swapped out with dependency injection.
 - Unit tests must be written to public API/interface only. Never make assumptions based on implementation details or members/types that are not accessible.
 - New code will not be accepted without corresponding unit tests.
 - All non-private members and types must be clearly documented with applicable and appropriate tagging (e.g. XML docs for C#, Javadoc for JS, etc.)
+- Never commit to the `main` branch. Always work via PRs.
+- In docs, when providing links, do so with the `[]()` link syntax so that they are proper clickable links. Also add any anchors and such so that users can easily navigate through the documents. Favor doc usability, and make them look nice.
+- Keep repository concerns separated: project-wide docs/scripts/config belong in the root repository, while backend-only/frontend-only docs/scripts/config belong in their respective submodule folders (e.g. `backend/docs`, `frontend/docs`, submodule-local compose/config files).
+- You may update `AGENTS.md` files (root and submodules) as needed to improve project context, clarify standards, and preserve useful working guidance as the project evolves.
