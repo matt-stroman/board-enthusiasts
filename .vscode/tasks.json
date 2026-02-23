@@ -4,13 +4,11 @@
     {
       "label": "tpl: dependencies up",
       "type": "shell",
-      "command": "pwsh",
+      "command": "python",
       "args": [
-        "-NoProfile",
-        "-File",
-        "${workspaceFolder}/scripts/dev.ps1",
+        "${workspaceFolder}/scripts/dev.py",
         "up",
-        "-DependenciesOnly"
+        "--dependencies-only"
       ],
       "options": {
         "cwd": "${workspaceFolder}"
@@ -20,11 +18,9 @@
     {
       "label": "tpl: dependencies down",
       "type": "shell",
-      "command": "pwsh",
+      "command": "python",
       "args": [
-        "-NoProfile",
-        "-File",
-        "${workspaceFolder}/scripts/dev.ps1",
+        "${workspaceFolder}/scripts/dev.py",
         "down"
       ],
       "options": {

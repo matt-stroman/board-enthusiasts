@@ -15,8 +15,8 @@ This repository currently tracks backend and frontend as git submodules.
 Quick start (backend API + local Postgres via automation):
 
 ```bash
-pwsh ./scripts/dev.ps1 bootstrap
-pwsh ./scripts/dev.ps1 up
+python ./scripts/dev.py bootstrap
+python ./scripts/dev.py up
 ```
 
 Initialize them after clone:
@@ -35,22 +35,27 @@ git submodule status
 
 - Project-wide docs:
   - Technology recommendation: [`docs/technology-fit-recommendation.md`](docs/technology-fit-recommendation.md)
+  - Developer CLI (root automation commands): [`docs/developer-cli.md`](docs/developer-cli.md)
 - Backend-specific docs (in backend submodule):
   - Backend phase 1 (PostgreSQL local setup): [`backend/docs/backend-phase-1-postgres-setup.md`](backend/docs/backend-phase-1-postgres-setup.md)
   - New developer setup / quick start (current backend MVP): [`backend/docs/new-developer-setup.md`](backend/docs/new-developer-setup.md)
 
 ## Developer Automation
 
-Root script entry point:
+Primary root script entry point:
 
-- [`scripts/dev.ps1`](scripts/dev.ps1)
+- [`scripts/dev.py`](scripts/dev.py)
+
+See the dedicated CLI doc for full command coverage and options:
+
+- [`docs/developer-cli.md`](docs/developer-cli.md)
 
 Examples:
 
 ```bash
-pwsh ./scripts/dev.ps1 doctor
-pwsh ./scripts/dev.ps1 bootstrap
-pwsh ./scripts/dev.ps1 up
-pwsh ./scripts/dev.ps1 test
-pwsh ./scripts/dev.ps1 down
+python ./scripts/dev.py doctor
+python ./scripts/dev.py bootstrap
+python ./scripts/dev.py up
+python ./scripts/dev.py test
+python ./scripts/dev.py down
 ```

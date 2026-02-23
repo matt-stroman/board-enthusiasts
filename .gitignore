@@ -1,2 +1,6 @@
 # Ignore Obsidian workspace metadata anywhere in the repository
 .obsidian/
+
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
