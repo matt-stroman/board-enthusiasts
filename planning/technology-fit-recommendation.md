@@ -58,7 +58,7 @@ Current versioning decision (implemented for backend):
 - **Cache/queue (later):** Redis (optional at first).
 - **API style:** REST-first, OpenAPI-described, UI-agnostic application operations.
 - **Client contract strategy:** shared DTO contracts and/or generated SDKs for MAUI, web, or other adapters.
-- **Auth:** OpenID Connect/JWT-compatible model (start simple; keep identity provider swappable).
+- **Auth:** OpenID Connect/JWT-compatible model, with Keycloak as the current provider and room to keep the identity provider swappable later.
 
 ### Client UI (Native-first)
 
@@ -112,6 +112,11 @@ Single deployable backend with internal modules, exposed through an API-first in
 
 Each module owns its schema segment and public interfaces.
 
+Current identity boundary:
+
+- Keycloak owns authentication, credentials, platform role assignment, and external identity-provider flows.
+- PostgreSQL should own only application data and, when needed, a local user projection linked to the Keycloak subject.
+
 Identity/access direction note (future, not MVP):
 
 - Plan for an API key capability for external application integrations and partner/server-side usage (project/app identification, quotas, revocation, usage tracking).
@@ -139,7 +144,7 @@ Guardrails for later if pursued:
 
 Use Postgres with hybrid relational + JSONB design:
 
-- Relational tables for core entities: users, developers, products, purchases, entitlements.
+- Relational tables for application-owned core entities: local user projections, developers, products, purchases, entitlements.
 - JSONB columns for provider-specific configuration payloads.
 - Outbox table for integration events (for reliable async later).
 

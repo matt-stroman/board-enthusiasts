@@ -15,11 +15,14 @@ for command-specific help.
 from __future__ import annotations
 
 import argparse
+import http.client
 import shlex
 import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +39,8 @@ class DevConfig:
         postgres_container_name: Expected local PostgreSQL container name.
         postgres_user: PostgreSQL username for local commands.
         postgres_database: PostgreSQL database name for local commands.
+        keycloak_container_name: Expected local Keycloak container name.
+        keycloak_ready_url: URL used to verify local Keycloak readiness.
         backend_project: Relative path to the backend API project file.
         backend_solution: Relative path to the backend solution file.
     """
@@ -45,6 +50,8 @@ class DevConfig:
     postgres_container_name: str
     postgres_user: str
     postgres_database: str
+    keycloak_container_name: str
+    keycloak_ready_url: str
     backend_project: str
     backend_solution: str
 
@@ -263,6 +270,36 @@ def wait_for_postgres(
     raise DevCliError(f"Timed out waiting for PostgreSQL container '{container_name}' to become ready.")
 
 
+def wait_for_http_ready(*, url: str, description: str, timeout_seconds: int = 90) -> None:
+    """Wait until an HTTP endpoint returns a successful status code.
+
+    Args:
+        url: URL to poll for readiness.
+        description: Human-readable service description for log output.
+        timeout_seconds: Maximum time to wait before failing.
+
+    Returns:
+        None.
+
+    Raises:
+        DevCliError: If the URL does not return a success status before timeout.
+    """
+
+    write_step(f"Waiting for {description} readiness (up to {timeout_seconds} seconds)")
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                if 200 <= response.status < 300:
+                    print(f"{description} is ready.")
+                    return
+        except (http.client.RemoteDisconnected, urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+            pass
+        time.sleep(2)
+
+    raise DevCliError(f"Timed out waiting for {description} readiness at {url}.")
+
+
 def ensure_submodules(config: DevConfig) -> None:
     """Initialize backend/frontend submodules when needed.
 
@@ -308,17 +345,17 @@ def restore_backend(config: DevConfig) -> None:
 
 
 def start_dependencies(config: DevConfig) -> None:
-    """Start/reuse the local PostgreSQL dependency and wait until it is ready.
+    """Start/reuse the local PostgreSQL and Keycloak dependencies and wait until they are ready.
 
     Args:
-        config: CLI configuration containing compose and PostgreSQL settings.
+        config: CLI configuration containing compose and local dependency settings.
 
     Returns:
         None.
 
     Raises:
         DevCliError: If Docker/compose is unavailable, the compose file is missing,
-            or PostgreSQL fails to start/become ready.
+            or a required local dependency fails to start/become ready.
     """
 
     assert_command_available("docker")
@@ -334,9 +371,7 @@ def start_dependencies(config: DevConfig) -> None:
             user=config.postgres_user,
             database=config.postgres_database,
         )
-        return
-
-    if existing_state is not None:
+    elif existing_state is not None:
         write_step(
             f"Starting existing PostgreSQL container '{config.postgres_container_name}' "
             f"(state: {existing_state})"
@@ -347,15 +382,29 @@ def start_dependencies(config: DevConfig) -> None:
             user=config.postgres_user,
             database=config.postgres_database,
         )
-        return
+    else:
+        write_step("Starting PostgreSQL via docker compose")
+        invoke_docker_compose(config, ["up", "-d", "postgres"])
+        wait_for_postgres(
+            container_name=config.postgres_container_name,
+            user=config.postgres_user,
+            database=config.postgres_database,
+        )
 
-    write_step("Starting PostgreSQL via docker compose")
-    invoke_docker_compose(config, ["up", "-d", "postgres"])
-    wait_for_postgres(
-        container_name=config.postgres_container_name,
-        user=config.postgres_user,
-        database=config.postgres_database,
-    )
+    keycloak_state = get_docker_container_state(config.keycloak_container_name)
+    if keycloak_state == "running":
+        write_step(f"Reusing existing Keycloak container '{config.keycloak_container_name}' (already running)")
+    elif keycloak_state is not None:
+        write_step(
+            f"Starting existing Keycloak container '{config.keycloak_container_name}' "
+            f"(state: {keycloak_state})"
+        )
+        run_command(["docker", "start", config.keycloak_container_name])
+    else:
+        write_step("Starting Keycloak via docker compose")
+        invoke_docker_compose(config, ["up", "-d", "keycloak"])
+
+    wait_for_http_ready(url=config.keycloak_ready_url, description="Keycloak")
 
 
 def stop_dependencies(config: DevConfig) -> None:
@@ -371,7 +420,7 @@ def stop_dependencies(config: DevConfig) -> None:
         DevCliError: If the compose command fails.
     """
 
-    write_step("Stopping PostgreSQL via docker compose")
+    write_step("Stopping local dependencies via docker compose")
     invoke_docker_compose(config, ["down"])
     remaining_state = get_docker_container_state(config.postgres_container_name)
     if remaining_state is not None:
@@ -380,13 +429,20 @@ def stop_dependencies(config: DevConfig) -> None:
             "(likely not created by this compose project)."
         )
         print(f"Stop it manually if desired: docker stop {config.postgres_container_name}")
+    keycloak_state = get_docker_container_state(config.keycloak_container_name)
+    if keycloak_state is not None:
+        print(
+            f"Note: container '{config.keycloak_container_name}' still exists "
+            "(likely not created by this compose project)."
+        )
+        print(f"Stop it manually if desired: docker stop {config.keycloak_container_name}")
 
 
 def show_status(config: DevConfig) -> None:
-    """Show docker compose and PostgreSQL readiness status.
+    """Show docker compose and dependency readiness status.
 
     Args:
-        config: CLI configuration containing compose and PostgreSQL settings.
+        config: CLI configuration containing compose and dependency settings.
 
     Returns:
         None.
@@ -421,6 +477,21 @@ def show_status(config: DevConfig) -> None:
     )
     if result.returncode != 0:
         print("Warning: PostgreSQL container is not ready (or container is not running).")
+
+    keycloak_state = get_docker_container_state(config.keycloak_container_name)
+    if keycloak_state is None:
+        print(f"Container '{config.keycloak_container_name}' was not found.")
+        return
+
+    write_step("Named Keycloak container status")
+    print(f"{config.keycloak_container_name} : {keycloak_state}")
+
+    write_step("Keycloak readiness")
+    try:
+        with urllib.request.urlopen(config.keycloak_ready_url, timeout=5) as response:
+            print(f"{config.keycloak_ready_url} : HTTP {response.status}")
+    except (http.client.RemoteDisconnected, urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as ex:
+        print(f"Warning: Keycloak readiness check failed: {ex}")
 
 
 def run_backend_api(config: DevConfig, *, do_restore: bool) -> None:
@@ -749,6 +820,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="PostgreSQL database name",
     )
     shared.add_argument(
+        "--keycloak-container-name",
+        "-KeycloakContainerName",
+        default="board_tpl_keycloak",
+        help="Keycloak container name",
+    )
+    shared.add_argument(
+        "--keycloak-ready-url",
+        "-KeycloakReadyUrl",
+        default="http://localhost:8080/realms/board-third-party-library/.well-known/openid-configuration",
+        help="Keycloak readiness URL",
+    )
+    shared.add_argument(
         "--backend-project",
         "-BackendProject",
         default="backend/src/Board.ThirdPartyLibrary.Api/Board.ThirdPartyLibrary.Api.csproj",
@@ -773,7 +856,7 @@ def build_parser() -> argparse.ArgumentParser:
     up = subparsers.add_parser(
         "up",
         parents=[shared],
-        help="Start/reuse PostgreSQL and run backend API",
+        help="Start/reuse PostgreSQL and Keycloak and run backend API",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     up.add_argument(
@@ -786,7 +869,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--dependencies-only",
         "-DependenciesOnly",
         action="store_true",
-        help="Start PostgreSQL only (do not run API)",
+        help="Start local dependencies only (do not run API)",
     )
     up.add_argument(
         "--skip-restore",
@@ -804,7 +887,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "status",
         parents=[shared],
-        help="Show docker compose and PostgreSQL readiness status",
+        help="Show docker compose and local dependency readiness status",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -864,6 +947,8 @@ def config_from_args(args: argparse.Namespace, repo_root: Path) -> DevConfig:
         postgres_container_name=args.postgres_container_name,
         postgres_user=args.postgres_user,
         postgres_database=args.postgres_database,
+        keycloak_container_name=args.keycloak_container_name,
+        keycloak_ready_url=args.keycloak_ready_url,
         backend_project=args.backend_project,
         backend_solution=args.backend_solution,
     )

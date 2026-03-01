@@ -25,7 +25,7 @@ This document provides quick guidance, common workflows, and project-specific no
 The developer CLI orchestrates common local development tasks from the repository root:
 
 - bootstrap submodules and restore backend dependencies
-- start/stop/reuse local PostgreSQL via Docker Compose
+- start/stop/reuse local PostgreSQL and Keycloak via Docker Compose
 - run the backend API
 - run backend tests
 - run environment diagnostics
@@ -48,7 +48,7 @@ python ./scripts/dev.py bootstrap
 python ./scripts/dev.py up
 ```
 
-### Start only PostgreSQL (no API)
+### Start only local dependencies (no API)
 
 ```bash
 python ./scripts/dev.py up --dependencies-only
@@ -114,6 +114,8 @@ Most commands accept shared overrides (see `--help` for full details), including
 - `--postgres-container-name`
 - `--postgres-user`
 - `--postgres-database`
+- `--keycloak-container-name`
+- `--keycloak-ready-url`
 - `--backend-project`
 - `--backend-solution`
 
@@ -125,5 +127,6 @@ python ./scripts/dev.py status --postgres-database my_local_db
 
 ## Notes
 
+- The `up`, `down`, and `status` commands manage the local PostgreSQL and Keycloak containers together.
 - The `down` command uses `docker compose down` and does **not** remove named volumes. Your local Postgres data persists unless you explicitly remove volumes.
 - VS Code tasks in this repo call the Python CLI directly.
