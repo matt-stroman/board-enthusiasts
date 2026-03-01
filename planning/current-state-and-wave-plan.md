@@ -18,7 +18,8 @@ It exists to make one distinction explicit:
 - the repository already implements a usable API/authentication foundation
 - Wave 1 application-owned identity persistence is implemented
 - Wave 2 organizations and memberships are now implemented
-- later relational catalog/integration waves still remain planned work
+- Wave 3 titles and versioned metadata are now implemented
+- later relational media/release/integration waves still remain planned work
 
 Use this document when deciding whether something belongs in the maintained current contract or in a future wave plan.
 
@@ -41,14 +42,15 @@ As of March 1, 2026, the maintained implemented surface is:
 - Keycloak-backed identity endpoints: `/identity/roles`, `/identity/auth/config`, `/identity/auth/login`, `/identity/auth/callback`, `/identity/me`
 - Board profile endpoints: `GET|PUT|DELETE /identity/me/board-profile`
 - organization endpoints: public `GET /organizations`, public `GET /organizations/{slug}`, authenticated `POST|PUT|DELETE /organizations...`, and authenticated membership management endpoints
-- EF Core persistence with migrations for `users`, `user_board_profiles`, `organizations`, and `organization_memberships`
+- catalog endpoints: public `GET /catalog`, public `GET /catalog/{organizationSlug}/{titleSlug}`, and authenticated title/metadata management endpoints
+- EF Core persistence with migrations for `users`, `user_board_profiles`, `organizations`, `organization_memberships`, `titles`, and `title_metadata_versions`
 - Postman mock-first contract assets for the above endpoints
 - backend endpoint unit tests plus Postgres-backed integration coverage for persistence and constraints
 - developer automation for local bootstrap, Docker dependencies, and test execution
 
 Not yet implemented:
 
-- titles, releases, integrations, commerce, and install-delivery schema
+- media assets, releases, integrations, commerce, and install-delivery schema
 - configured Keycloak brokers for social/game platform SSO in the local realm import
 
 Because those later items are not implemented, they should not remain in the maintained current API contract unless they are being actively delivered in the same wave with tests first.
@@ -77,11 +79,11 @@ Application identity projection and optional Board profile persistence:
 
 Organizations and memberships.
 
-### Wave 3 (next)
+### Wave 3 (implemented)
 
 Titles and versioned metadata.
 
-### Wave 4
+### Wave 4 (next)
 
 Media, releases, and APK artifacts.
 
