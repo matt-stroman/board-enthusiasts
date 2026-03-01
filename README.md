@@ -4,8 +4,9 @@ A solution for third party developers for the Board ecosystem to use to register
 
 Current implementation status:
 
-- the maintained API/backend surface is a Keycloak-backed identity and health foundation
-- EF Core migrations and application-owned persistence waves are planned next, not already implemented
+- the maintained API/backend surface now includes the Keycloak-backed identity and health foundation plus Wave 1 persistence
+- EF Core migrations, the local `users` projection, and Board profile linkage are implemented
+- the next planned implementation wave is organizations and memberships
 
 ## Table of Contents
 

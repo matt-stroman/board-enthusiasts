@@ -16,7 +16,8 @@ This document records the currently aligned architecture and delivery plan befor
 It exists to make one distinction explicit:
 
 - the repository already implements a usable API/authentication foundation
-- the relational schema and application-owned domain model waves are still planned work
+- Wave 1 application-owned identity persistence is implemented
+- later relational domain waves still remain planned work
 
 Use this document when deciding whether something belongs in the maintained current contract or in a future wave plan.
 
@@ -37,23 +38,22 @@ As of March 1, 2026, the maintained implemented surface is:
 
 - health endpoints: `/`, `/health/live`, `/health/ready`
 - Keycloak-backed identity endpoints: `/identity/roles`, `/identity/auth/config`, `/identity/auth/login`, `/identity/auth/callback`, `/identity/me`
+- Board profile endpoints: `GET|PUT|DELETE /identity/me/board-profile`
+- EF Core persistence with migrations for `users` and `user_board_profiles`
 - Postman mock-first contract assets for the above endpoints
-- backend endpoint unit tests and readiness integration coverage
+- backend endpoint unit tests plus Postgres-backed integration coverage for persistence and constraints
 - developer automation for local bootstrap, Docker dependencies, and test execution
 
 Not yet implemented:
 
-- EF Core persistence model and migrations
-- application-owned `users` projection table
-- `user_board_profiles` persistence and API CRUD
 - organizations, memberships, titles, releases, integrations, commerce, and install-delivery schema
 - configured Keycloak brokers for social/game platform SSO in the local realm import
 
-Because those items are not implemented, they should not remain in the maintained current API contract unless they are being actively delivered in the same wave with tests first.
+Because those later items are not implemented, they should not remain in the maintained current API contract unless they are being actively delivered in the same wave with tests first.
 
 ## Wave Realignment
 
-To avoid contract drift, the project should treat the current backend as a foundation phase and start the next schema work from a clean boundary.
+To avoid contract drift, the project should treat the current backend as a completed foundation plus Wave 1 baseline and start the next schema work from a clean boundary.
 
 ### Foundation (implemented)
 
@@ -62,16 +62,16 @@ To avoid contract drift, the project should treat the current backend as a found
 - platform role catalog exposure
 - health/readiness automation and test coverage
 
-### Wave 1 (next)
+### Wave 1 (implemented)
 
 Application identity projection and optional Board profile persistence:
 
-- add EF Core + migrations
-- implement `users` keyed by immutable Keycloak subject
-- decide whether `user_board_profiles` belongs in Wave 1 or a small Wave 1b immediately after `users`
-- only add `/identity/me/board-profile` endpoints back into the maintained contract when failing Postman contract tests and backend persistence tests are in place
+- EF Core + migrations
+- `users` keyed by immutable Keycloak subject
+- `user_board_profiles` for optional Board linkage/cache
+- `/identity/me/board-profile` endpoints restored to the maintained contract with backend tests and implementation
 
-### Wave 2
+### Wave 2 (next)
 
 Organizations and memberships.
 
