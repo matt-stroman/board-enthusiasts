@@ -4,9 +4,9 @@ A solution for third party developers for the Board ecosystem to use to register
 
 Current implementation status:
 
-- the maintained API/backend surface includes the Keycloak-backed identity and health foundation plus Wave 1 persistence, Wave 2 organizations/memberships, Wave 3 titles/versioned metadata, and Wave 4 media/releases/APK artifact metadata
-- EF Core migrations for `users`, `user_board_profiles`, `organizations`, `organization_memberships`, `titles`, `title_metadata_versions`, `title_media_assets`, `title_releases`, and `release_artifacts` are implemented
-- the next planned implementation wave is Wave 5 external acquisition bindings
+- the maintained API/backend surface includes the Keycloak-backed identity and health foundation plus Waves 1 through 5 of the current schema plan
+- EF Core migrations for `users`, `user_board_profiles`, `organizations`, `organization_memberships`, `titles`, `title_metadata_versions`, `title_media_assets`, `title_releases`, `release_artifacts`, `supported_publishers`, `integration_connections`, and `title_integration_bindings` are implemented
+- the next planned implementation wave is Wave 6 unified commerce and entitlements
 
 ## Table of Contents
 
