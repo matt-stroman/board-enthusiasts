@@ -11,7 +11,7 @@
 
 ## Purpose
 
-This document records the currently aligned architecture and delivery plan after Wave 4 implementation.
+This document records the currently aligned architecture and delivery plan after Wave 5 implementation.
 
 It exists to make one distinction explicit:
 
@@ -20,6 +20,7 @@ It exists to make one distinction explicit:
 - Wave 2 organizations and memberships are now implemented
 - Wave 3 titles and versioned metadata are now implemented
 - Wave 4 media, releases, and APK artifact metadata are now implemented
+- Wave 5 supported publishers and external acquisition bindings are now implemented
 - later acquisition, commerce, and install-delivery waves still remain planned work
 
 Use this document when deciding whether something belongs in the maintained current contract or in a future wave plan.
@@ -43,15 +44,14 @@ As of March 2, 2026, the maintained implemented surface is:
 - Keycloak-backed identity endpoints: `/identity/roles`, `/identity/auth/config`, `/identity/auth/login`, `/identity/auth/callback`, `/identity/me`
 - Board profile endpoints: `GET|PUT|DELETE /identity/me/board-profile`
 - organization endpoints: public `GET /organizations`, public `GET /organizations/{slug}`, authenticated `POST|PUT|DELETE /organizations...`, and authenticated membership management endpoints
-- catalog endpoints: public `GET /catalog`, public `GET /catalog/{organizationSlug}/{titleSlug}`, authenticated title/metadata management endpoints, and authenticated media/release/artifact management endpoints
-- EF Core persistence with migrations for `users`, `user_board_profiles`, `organizations`, `organization_memberships`, `titles`, `title_metadata_versions`, `title_media_assets`, `title_releases`, and `release_artifacts`
+- catalog endpoints: public `GET /catalog`, public `GET /catalog/{organizationSlug}/{titleSlug}`, authenticated title/metadata management endpoints, authenticated media/release/artifact management endpoints, public `GET /supported-publishers`, and authenticated connection/acquisition-binding management endpoints
+- EF Core persistence with migrations for `users`, `user_board_profiles`, `organizations`, `organization_memberships`, `titles`, `title_metadata_versions`, `title_media_assets`, `title_releases`, `release_artifacts`, `supported_publishers`, `integration_connections`, and `title_integration_bindings`
 - Postman mock-first contract assets for the above endpoints
 - backend endpoint unit tests plus Postgres-backed integration coverage for persistence and constraints
 - developer automation for local bootstrap, Docker dependencies, and test execution
 
 Not yet implemented:
 
-- Wave 5 external acquisition bindings
 - Wave 6 unified commerce and entitlements
 - Wave 7 Board install-delivery flows
 - configured Keycloak brokers for social/game platform SSO in the local realm import
@@ -111,11 +111,20 @@ Implemented Wave 4 behavior includes:
 
 See [`backend/docs/title-catalog-schema.md`](../backend/docs/title-catalog-schema.md) for the maintained Wave 3 and Wave 4 title/catalog reference.
 
-### Wave 5
+### Wave 5 (implemented)
 
 Publisher-agnostic external acquisition bindings.
 
-This wave should add a platform-managed `supported_publishers` registry plus organization/title acquisition bindings so titles can point at external store/publisher acquisition pages without requiring provider-specific checkout or install behavior.
+Status: implemented on March 2, 2026.
+
+Implemented Wave 5 behavior includes:
+
+- a platform-managed `supported_publishers` registry surfaced through `GET /supported-publishers`
+- reusable organization-scoped `integration_connections` that can reference a supported publisher or organization-owned custom publisher details
+- title-scoped `title_integration_bindings` for external acquisition URLs and optional acquisition labels/configuration
+- public catalog list exposure of `acquisitionUrl` only
+- public catalog detail exposure of the current primary acquisition summary
+- enforced primary-binding invariants for enabled title acquisition links
 
 It should also allow a custom publisher/store fallback when no supported registry entry fits, while keeping shared custom-publisher management endpoints out of scope.
 
