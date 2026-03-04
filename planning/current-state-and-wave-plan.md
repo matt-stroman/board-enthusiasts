@@ -11,7 +11,7 @@
 
 ## Purpose
 
-This document records the currently aligned architecture and delivery plan after Wave 5 implementation.
+This document records the currently aligned architecture and delivery plan after Wave 6 developer-enrollment workflow implementation.
 
 It exists to make one distinction explicit:
 
@@ -39,11 +39,11 @@ The project remains aligned to these decisions:
 
 ## Current Implemented State
 
-As of March 3, 2026, the maintained implemented surface is:
+As of March 4, 2026, the maintained implemented surface is:
 
 - health endpoints: `/`, `/health/live`, `/health/ready`
-- Keycloak-backed identity endpoints: `/identity/roles`, `/identity/auth/config`, `/identity/auth/login`, `/identity/auth/callback`, `/identity/me`, `GET|POST /identity/me/developer-enrollment`
-- moderation endpoints: `GET /moderation/developer-enrollment-requests`, `POST /moderation/developer-enrollment-requests/{requestId}/approve`, `POST /moderation/developer-enrollment-requests/{requestId}/reject`
+- Keycloak-backed identity endpoints: `/identity/roles`, `/identity/auth/config`, `/identity/auth/login`, `/identity/auth/callback`, `/identity/me`, `GET|POST /identity/me/developer-enrollment`, `POST /identity/me/developer-enrollment/{requestId}/cancel`, `GET /identity/me/developer-enrollment/{requestId}/conversation`, `POST /identity/me/developer-enrollment/{requestId}/messages`, `GET /identity/me/developer-enrollment/{requestId}/attachments/{attachmentId}`, and `GET /identity/me/notifications`, `POST /identity/me/notifications/{notificationId}/read`
+- moderation endpoints: `GET /moderation/developer-enrollment-requests`, `POST /moderation/developer-enrollment-requests/{requestId}/approve`, `POST /moderation/developer-enrollment-requests/{requestId}/reject`, `POST /moderation/developer-enrollment-requests/{requestId}/request-more-information`, `GET /moderation/developer-enrollment-requests/{requestId}/conversation`, and `GET /moderation/developer-enrollment-requests/{requestId}/attachments/{attachmentId}`
 - Board profile endpoints: `GET|PUT|DELETE /identity/me/board-profile`
 - organization endpoints: public `GET /organizations`, public `GET /organizations/{slug}`, authenticated `POST|PUT|DELETE /organizations...`, and authenticated membership management endpoints
 - catalog endpoints: public `GET /catalog`, public `GET /catalog/{organizationSlug}/{titleSlug}`, authenticated title/metadata management endpoints, authenticated media/release/artifact management endpoints, public `GET /supported-publishers`, and authenticated connection/acquisition-binding management endpoints
@@ -72,7 +72,7 @@ To avoid contract drift, the project should treat the current backend as a compl
 - bearer-token validation and current-user projection from claims
 - platform role catalog exposure
 - health/readiness automation and test coverage
-- review-based developer enrollment workflow with PostgreSQL-backed request status and moderator approval/rejection endpoints
+- review-based developer enrollment workflow with PostgreSQL-backed request history, moderation messaging/attachments, applicant replies/cancellation, in-app notifications, and moderator approval/rejection/request-more-information endpoints
 
 ### Wave 1 (implemented)
 
