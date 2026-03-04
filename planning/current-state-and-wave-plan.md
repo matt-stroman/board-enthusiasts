@@ -41,7 +41,7 @@ The project remains aligned to these decisions:
 As of March 2, 2026, the maintained implemented surface is:
 
 - health endpoints: `/`, `/health/live`, `/health/ready`
-- Keycloak-backed identity endpoints: `/identity/roles`, `/identity/auth/config`, `/identity/auth/login`, `/identity/auth/callback`, `/identity/me`
+- Keycloak-backed identity endpoints: `/identity/roles`, `/identity/auth/config`, `/identity/auth/login`, `/identity/auth/callback`, `/identity/me`, `POST /identity/me/developer-enrollment`
 - Board profile endpoints: `GET|PUT|DELETE /identity/me/board-profile`
 - organization endpoints: public `GET /organizations`, public `GET /organizations/{slug}`, authenticated `POST|PUT|DELETE /organizations...`, and authenticated membership management endpoints
 - catalog endpoints: public `GET /catalog`, public `GET /catalog/{organizationSlug}/{titleSlug}`, authenticated title/metadata management endpoints, authenticated media/release/artifact management endpoints, public `GET /supported-publishers`, and authenticated connection/acquisition-binding management endpoints
@@ -54,7 +54,6 @@ Not yet implemented:
 
 - authenticated player library read models and personalization
 - private player wishlist management
-- separate post-sign-in developer enrollment workflows
 - Wave 6 unified commerce and entitlements
 - Wave 7 Board install-delivery flows
 - configured Keycloak brokers for social/game platform SSO in the local realm import
@@ -133,16 +132,15 @@ It should also allow a custom publisher/store fallback when no supported registr
 
 ### Wave 6
 
-Player library foundation, developer enrollment, unified commerce, and entitlements.
+Player library foundation, unified commerce, and entitlements.
 
-This wave should introduce the first authenticated player-owned library surface and keep developer access as an explicit post-sign-in opt-in rather than a default registration outcome.
+This wave should introduce the first authenticated player-owned library surface and continue building on the player-first onboarding flow already in place.
 
 Planned Wave 6 behavior includes:
 
 - authenticated player-library read models for owned titles
 - wishlist persistence and private wishlist retrieval
 - room for future player collections and favorites in the same player-owned surface
-- a developer-enrollment workflow that upgrades a signed-in player into a developer without exposing raw backend roles in the UI
 - purchase state and ownership modeling inside the library rather than relying only on external acquisition links
 
 ### Wave 7
