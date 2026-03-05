@@ -6,6 +6,7 @@ This script is the primary developer automation entry point for:
 - dependency lifecycle (`up`, `down`, `status`)
 - full local web stack execution (`web`)
 - frontend web UI execution (`frontend`)
+- full-stack verification in one pass (`all-tests`)
 - repository verification (`verify`)
 - backend testing (`test`)
 - API contract linting/testing and Postman workspace operations
@@ -109,6 +110,7 @@ MAILPIT_SERVER_KEY_RELATIVE_PATH = "backend/mailpit/certs/server.key"
 POSTGRES_SERVER_CERT_RELATIVE_PATH = "backend/postgres/certs/server.crt"
 POSTGRES_SERVER_KEY_RELATIVE_PATH = "backend/postgres/certs/server.key"
 REDOCLY_CLI_VERSION = "2.20.3"
+KEYCLOAK_READY_TIMEOUT_SECONDS = 240
 
 
 def get_web_stack_state_path(config: DevConfig) -> Path:
@@ -580,8 +582,15 @@ def ensure_dotnet_dev_certificate_trusted() -> None:
     """
 
     assert_command_available("dotnet")
+    supports_trust = sys.platform.startswith("win") or sys.platform == "darwin"
     check = run_command(
-        ["dotnet", "dev-certs", "https", "--check", "--trust"],
+        [
+            "dotnet",
+            "dev-certs",
+            "https",
+            "--check",
+            *(["--trust"] if supports_trust else []),
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -589,8 +598,13 @@ def ensure_dotnet_dev_certificate_trusted() -> None:
     if check.returncode == 0:
         return
 
-    write_step("Trusting the .NET HTTPS development certificate")
-    run_command(["dotnet", "dev-certs", "https", "--trust"], check=True, capture_output=False, text=True)
+    if supports_trust:
+        write_step("Trusting the .NET HTTPS development certificate")
+        run_command(["dotnet", "dev-certs", "https", "--trust"], check=True, capture_output=False, text=True)
+        return
+
+    write_step("Ensuring the .NET HTTPS development certificate exists")
+    run_command(["dotnet", "dev-certs", "https"], check=True, capture_output=False, text=True)
 
 
 def ensure_keycloak_https_certificate_exported(config: DevConfig) -> Path:
@@ -826,6 +840,7 @@ def probe_http_url(url: str, *, timeout_seconds: int = 5) -> tuple[bool, str | N
             str(timeout_seconds),
         ]
         if is_https_url(url):
+            curl_args.append("--http2")
             curl_args.append("--insecure")
         curl_args.append(url)
 
@@ -1152,11 +1167,12 @@ def restore_backend(config: DevConfig) -> None:
     run_command(["dotnet", "restore", str(solution_path)], cwd=backend_root)
 
 
-def start_dependencies(config: DevConfig) -> None:
-    """Start/reuse the local PostgreSQL and Keycloak dependencies and wait until they are ready.
+def start_dependencies(config: DevConfig, *, include_keycloak: bool = True) -> None:
+    """Start/reuse local dependencies and wait until they are ready.
 
     Args:
         config: CLI configuration containing compose and local dependency settings.
+        include_keycloak: Whether to start and wait for Keycloak readiness.
 
     Returns:
         None.
@@ -1169,7 +1185,7 @@ def start_dependencies(config: DevConfig) -> None:
     ensure_docker_daemon_available()
     ensure_postgres_tls_material_exported(config)
     ensure_mailpit_tls_material_exported(config)
-    if is_https_url(config.keycloak_ready_url):
+    if include_keycloak and is_https_url(config.keycloak_ready_url):
         ensure_keycloak_https_certificate_exported(config)
     compose_full_path = config.repo_root / config.compose_file
     if not compose_full_path.exists():
@@ -1218,20 +1234,25 @@ def start_dependencies(config: DevConfig) -> None:
 
     wait_for_http_ready(url=config.mailpit_ready_url, description="Mailpit")
 
-    keycloak_state = get_docker_container_state(config.keycloak_container_name)
-    if keycloak_state == "running":
-        write_step(f"Reusing existing Keycloak container '{config.keycloak_container_name}' (already running)")
-    elif keycloak_state is not None:
-        write_step(
-            f"Starting existing Keycloak container '{config.keycloak_container_name}' "
-            f"(state: {keycloak_state})"
-        )
-        run_command(["docker", "start", config.keycloak_container_name])
-    else:
-        write_step("Starting Keycloak via docker compose")
-        invoke_docker_compose(config, ["up", "-d", "keycloak"])
+    if include_keycloak:
+        keycloak_state = get_docker_container_state(config.keycloak_container_name)
+        if keycloak_state == "running":
+            write_step(f"Reusing existing Keycloak container '{config.keycloak_container_name}' (already running)")
+        elif keycloak_state is not None:
+            write_step(
+                f"Starting existing Keycloak container '{config.keycloak_container_name}' "
+                f"(state: {keycloak_state})"
+            )
+            run_command(["docker", "start", config.keycloak_container_name])
+        else:
+            write_step("Starting Keycloak via docker compose")
+            invoke_docker_compose(config, ["up", "-d", "keycloak"])
 
-    wait_for_http_ready(url=config.keycloak_ready_url, description="Keycloak")
+        wait_for_http_ready(
+            url=config.keycloak_ready_url,
+            description="Keycloak",
+            timeout_seconds=KEYCLOAK_READY_TIMEOUT_SECONDS,
+        )
 
 
 def stop_dependencies(config: DevConfig) -> None:
@@ -1392,7 +1413,7 @@ def run_frontend_web_ui(
     do_npm_install: bool,
     do_css_build: bool,
     do_restore: bool,
-    watch_css: bool,
+    hot_reload: bool,
 ) -> None:
     """Run the frontend web UI from the repository root.
 
@@ -1402,7 +1423,7 @@ def run_frontend_web_ui(
         do_npm_install: Whether to install frontend JavaScript dependencies first.
         do_css_build: Whether to build Tailwind CSS before launching the app.
         do_restore: Whether to restore the frontend .NET project before launching.
-        watch_css: Whether to start a background Tailwind watch process.
+        hot_reload: Whether to enable frontend hot reload, including Tailwind watch.
 
     Returns:
         None.
@@ -1459,7 +1480,7 @@ def run_frontend_web_ui(
     css_watch_process: subprocess.Popen | None = None
     css_watch_log_path: Path | None = None
     try:
-        if watch_css:
+        if hot_reload:
             logs_dir = config.repo_root / ".dev-cli-logs"
             css_watch_log_path = logs_dir / "frontend-css-watch.log"
             write_step("Starting frontend Tailwind watch in the background")
@@ -1470,17 +1491,12 @@ def run_frontend_web_ui(
             )
             print(f"Tailwind watch log: {css_watch_log_path}")
 
-        write_step(f"Starting frontend web UI at {config.frontend_base_url} (Ctrl+C to stop)")
+        write_step(f"Starting frontend web UI with hot reload at {config.frontend_base_url} (Ctrl+C to stop)")
         run_command(
-            ["dotnet", "run", "--project", str(project_path), "--no-restore", "--no-launch-profile"],
+            get_frontend_web_launch_command(project_path),
             cwd=frontend_root,
             check=True,
-            env=build_subprocess_env(
-                extra={
-                    "ASPNETCORE_URLS": config.frontend_base_url,
-                    "ASPNETCORE_ENVIRONMENT": "Development",
-                }
-            ),
+            env=build_frontend_web_environment(frontend_url=config.frontend_base_url),
         )
     finally:
         if css_watch_process is not None:
@@ -1496,7 +1512,7 @@ def run_full_local_web_stack(
     do_frontend_npm_install: bool,
     do_frontend_css_build: bool,
     do_frontend_restore: bool,
-    watch_css: bool,
+    hot_reload: bool,
     open_browser_on_ready: bool,
     backend_url: str,
     frontend_url: str,
@@ -1510,7 +1526,7 @@ def run_full_local_web_stack(
         do_frontend_npm_install: Whether to install frontend JavaScript dependencies first.
         do_frontend_css_build: Whether to build Tailwind CSS before launching the frontend.
         do_frontend_restore: Whether to restore the frontend web project before launch.
-        watch_css: Whether to run Tailwind CSS watch in a background process.
+        hot_reload: Whether to enable frontend hot reload, including Tailwind watch.
         open_browser_on_ready: Whether to open the system browser when the frontend is reachable.
         backend_url: Backend URL to bind and probe.
         frontend_url: Frontend URL to bind, probe, and open in the browser.
@@ -1585,7 +1601,7 @@ def run_full_local_web_stack(
             if keycloak_detail:
                 print(f"Keycloak probe detail: {keycloak_detail}")
 
-        if watch_css:
+        if hot_reload:
             css_watch_log_path = (config.repo_root / ".dev-cli-logs") / "frontend-css-watch.log"
             write_step("Starting frontend Tailwind watch in the background")
             css_watch_process = start_background_command(
@@ -1595,7 +1611,7 @@ def run_full_local_web_stack(
             )
             print(f"Tailwind watch log: {css_watch_log_path}")
 
-        write_step("Starting frontend web UI in the background")
+        write_step("Starting frontend web UI with hot reload in the background")
         frontend_process, frontend_log_path = start_frontend_web_process_with_log(
             config,
             frontend_url=frontend_url,
@@ -1670,7 +1686,7 @@ def show_web_stack_status(config: DevConfig) -> None:
     state = load_web_stack_state(config)
     if state is None:
         print("No active root-managed web stack state file was found.")
-        print("Start it with: python ./scripts/dev.py web --watch-css")
+        print("Start it with: python ./scripts/dev.py web --hot-reload")
         return
 
     print(f"State file: {get_web_stack_state_path(config)}")
@@ -1780,6 +1796,38 @@ def start_background_command_with_log(
     return process, log_path
 
 
+def get_frontend_web_launch_command(project_path: Path) -> list[str]:
+    """Return the frontend web launch command with Razor hot reload enabled.
+
+    Args:
+        project_path: Frontend web project path.
+
+    Returns:
+        Command tokens for launching the frontend with ``dotnet watch run``.
+    """
+
+    return ["dotnet", "watch", "--project", str(project_path), "run", "--no-restore", "--no-launch-profile"]
+
+
+def build_frontend_web_environment(*, frontend_url: str) -> dict[str, str]:
+    """Build the environment used by frontend web runs with hot reload.
+
+    Args:
+        frontend_url: URL the frontend should bind to.
+
+    Returns:
+        Environment variables for the frontend process.
+    """
+
+    return build_subprocess_env(
+        extra={
+            "ASPNETCORE_URLS": frontend_url,
+            "ASPNETCORE_ENVIRONMENT": "Development",
+            "DOTNET_WATCH_RESTART_ON_RUDE_EDIT": "true",
+        }
+    )
+
+
 def start_frontend_web_process_with_log(
     config: DevConfig,
     *,
@@ -1802,16 +1850,11 @@ def start_frontend_web_process_with_log(
         raise DevCliError(f"Frontend web project not found: {project_path}")
 
     return start_background_command_with_log(
-        cmd=["dotnet", "run", "--project", str(project_path), "--no-restore", "--no-launch-profile"],
+        cmd=get_frontend_web_launch_command(project_path),
         cwd=frontend_root,
         log_name="frontend-web.log",
         config=config,
-        env=build_subprocess_env(
-            extra={
-                "ASPNETCORE_URLS": frontend_url,
-                "ASPNETCORE_ENVIRONMENT": "Development",
-            }
-        ),
+        env=build_frontend_web_environment(frontend_url=frontend_url),
     )
 
 
@@ -1853,6 +1896,49 @@ def run_tests(config: DevConfig, *, run_integration: bool, restore: bool = True)
         )
     else:
         print("Skipping integration tests.")
+
+
+def restore_frontend(config: DevConfig) -> None:
+    """Restore the frontend solution.
+
+    Args:
+        config: CLI configuration containing frontend solution paths.
+
+    Returns:
+        None.
+
+    Raises:
+        DevCliError: If ``dotnet`` is unavailable or restore fails.
+    """
+
+    assert_command_available("dotnet")
+    frontend_root = config.repo_root / config.frontend_root
+    solution_path = config.repo_root / config.frontend_solution
+    write_step("Restoring frontend solution")
+    run_command(["dotnet", "restore", str(solution_path)], cwd=frontend_root)
+
+
+def run_frontend_tests(config: DevConfig, *, restore: bool = True) -> None:
+    """Run frontend tests.
+
+    Args:
+        config: CLI configuration containing frontend test project/solution paths.
+        restore: Whether to restore packages before running tests.
+
+    Returns:
+        None.
+
+    Raises:
+        DevCliError: If ``dotnet`` is unavailable or test execution fails.
+    """
+
+    assert_command_available("dotnet")
+    frontend_root = config.repo_root / config.frontend_root
+    solution_path = config.repo_root / config.frontend_solution
+    restore_args = [] if restore else ["--no-restore"]
+
+    write_step("Running frontend tests")
+    run_command(["dotnet", "test", str(solution_path), *restore_args], cwd=frontend_root)
 
 
 def validate_backend_xml_docs(config: DevConfig) -> None:
@@ -2054,7 +2140,7 @@ def run_api_contract_tests(
             raise DevCliError("--start-backend can only be used with a local base URL.")
         if is_https_url(base_url):
             ensure_dotnet_dev_certificate_trusted()
-        start_dependencies(config)
+        start_dependencies(config, include_keycloak=False)
         write_step("Starting backend API in the background for contract tests")
         backend_process, backend_log_path = start_backend_api_process(config)
         try:
@@ -2271,10 +2357,11 @@ def run_doctor(config: DevConfig) -> None:
         print()
         print("Suggested next steps:")
         print("  python ./scripts/dev.py bootstrap")
-        print("  python ./scripts/dev.py web --watch-css")
-        print("  python ./scripts/dev.py frontend --watch-css")
+        print("  python ./scripts/dev.py web --hot-reload")
+        print("  python ./scripts/dev.py frontend --hot-reload")
         print("  python ./scripts/dev.py up --dependencies-only")
         print("  python ./scripts/dev.py up --skip-restore")
+        print("  python ./scripts/dev.py all-tests")
         print("  python ./scripts/dev.py api-test --start-backend --skip-lint")
     else:
         print("PASS (no issues detected)")
@@ -2286,10 +2373,11 @@ def run_doctor(config: DevConfig) -> None:
         print()
         print("Suggested next steps:")
         print("  python ./scripts/dev.py bootstrap")
-        print("  python ./scripts/dev.py web --watch-css")
-        print("  python ./scripts/dev.py frontend --watch-css")
+        print("  python ./scripts/dev.py web --hot-reload")
+        print("  python ./scripts/dev.py frontend --hot-reload")
         print("  python ./scripts/dev.py up --dependencies-only")
         print("  python ./scripts/dev.py up --skip-restore")
+        print("  python ./scripts/dev.py all-tests")
         print("  python ./scripts/dev.py api-test --start-backend --skip-lint")
         print("  python ./scripts/dev.py api-lint")
 
@@ -2330,6 +2418,53 @@ def run_verify(
         print("Skipping API contract tests.")
         return
 
+    run_api_contract_tests(
+        config,
+        environment_path=environment_path,
+        base_url=base_url,
+        contract_execution_mode=contract_execution_mode,
+        report_path=report_path,
+        lint_spec=False,
+        start_backend=start_backend,
+    )
+
+
+def run_all_tests(
+    config: DevConfig,
+    *,
+    bootstrap: bool,
+    environment_path: Path,
+    base_url: str,
+    contract_execution_mode: str,
+    report_path: Path,
+    start_backend: bool,
+) -> None:
+    """Run the full cross-repository validation workflow in one command.
+
+    Args:
+        config: CLI configuration containing backend, frontend, and API paths.
+        bootstrap: Whether to initialize submodules first when needed.
+        environment_path: Postman environment file for contract runs.
+        base_url: Base URL used for API contract execution.
+        contract_execution_mode: Contract execution mode (`live` or `mock`).
+        report_path: JUnit report output path for Postman CLI contract runs.
+        start_backend: Whether to auto-start backend/dependencies for contract runs.
+
+    Returns:
+        None.
+    """
+
+    if bootstrap:
+        ensure_submodules(config)
+
+    restore_backend(config)
+    validate_backend_xml_docs(config)
+    run_tests(config, run_integration=True, restore=False)
+
+    restore_frontend(config)
+    run_frontend_tests(config, restore=False)
+
+    run_api_spec_lint(config)
     run_api_contract_tests(
         config,
         environment_path=environment_path,
@@ -2580,7 +2715,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-restore",
         "-SkipRestore",
         action="store_true",
-        help="Skip dotnet restore before dotnet run",
+        help="Skip dotnet restore before dotnet watch run",
     )
 
     frontend = subparsers.add_parser(
@@ -2611,13 +2746,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-restore",
         "-SkipRestore",
         action="store_true",
-        help="Skip dotnet restore before dotnet run",
+        help="Skip dotnet restore before dotnet watch run",
     )
     frontend.add_argument(
-        "--watch-css",
-        "-WatchCss",
+        "--hot-reload",
+        "-HotReload",
         action="store_true",
-        help="Run Tailwind CSS watch in a background process while the app is running",
+        help="Enable frontend hot reload, including Tailwind watch, while the app is running",
     )
 
     web = subparsers.add_parser(
@@ -2657,10 +2792,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip frontend dotnet restore before startup",
     )
     web.add_argument(
-        "--watch-css",
-        "-WatchCss",
+        "--hot-reload",
+        "-HotReload",
         action="store_true",
-        help="Run Tailwind CSS watch in a background process while the app is running",
+        help="Enable frontend hot reload, including Tailwind watch, while the app is running",
     )
     web.add_argument(
         "--no-browser",
@@ -2721,6 +2856,49 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     test.add_argument("--skip-integration", "-SkipIntegration", action="store_true", help="Skip integration tests")
+
+    all_tests = subparsers.add_parser(
+        "all-tests",
+        parents=[shared],
+        help="Run backend/frontend tests, docs validation, API lint, and API contract tests",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    all_tests.add_argument(
+        "--bootstrap",
+        "-Bootstrap",
+        action="store_true",
+        help="Run submodule initialization checks before validation",
+    )
+    all_tests.add_argument(
+        "--environment",
+        default="api/postman/environments/board-third-party-library_local.postman_environment.json",
+        help="Postman environment file path used for contract tests",
+    )
+    all_tests.add_argument(
+        "--base-url",
+        "-BaseUrl",
+        default="https://localhost:7085",
+        help="Base URL injected into contract test runs",
+    )
+    all_tests.add_argument(
+        "--contract-execution-mode",
+        "-ContractExecutionMode",
+        choices=("live", "mock"),
+        default="live",
+        help="Contract execution mode variable value for Postman runs",
+    )
+    all_tests.add_argument(
+        "--report-path",
+        "-ReportPath",
+        default="api/postman-cli-reports/all-tests-contract-tests.xml",
+        help="JUnit report output path for Postman contract runs",
+    )
+    all_tests.add_argument(
+        "--no-start-backend",
+        "-NoStartBackend",
+        action="store_true",
+        help="Do not auto-start local dependencies/backend for contract tests",
+    )
 
     verify = subparsers.add_parser(
         "verify",
@@ -2979,7 +3157,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 do_npm_install=not args.skip_npm_install,
                 do_css_build=not args.skip_css_build,
                 do_restore=not args.skip_restore,
-                watch_css=args.watch_css,
+                hot_reload=args.hot_reload,
             )
         elif args.command == "web":
             run_full_local_web_stack(
@@ -2989,7 +3167,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 do_frontend_npm_install=not args.skip_npm_install,
                 do_frontend_css_build=not args.skip_css_build,
                 do_frontend_restore=not args.skip_frontend_restore,
-                watch_css=args.watch_css,
+                hot_reload=args.hot_reload,
                 open_browser_on_ready=not args.no_browser,
                 backend_url=args.backend_url,
                 frontend_url=args.frontend_url,
@@ -3005,6 +3183,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             show_status(config)
         elif args.command == "test":
             run_tests(config, run_integration=not args.skip_integration)
+        elif args.command == "all-tests":
+            run_all_tests(
+                config,
+                bootstrap=args.bootstrap,
+                environment_path=(config.repo_root / args.environment).resolve(),
+                base_url=args.base_url,
+                contract_execution_mode=args.contract_execution_mode,
+                report_path=(config.repo_root / args.report_path).resolve(),
+                start_backend=not args.no_start_backend,
+            )
         elif args.command == "verify":
             run_verify(
                 config,

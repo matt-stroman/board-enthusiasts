@@ -23,10 +23,10 @@ Quick start (full local web stack from the root workspace):
 
 ```bash
 python ./scripts/dev.py bootstrap
-python ./scripts/dev.py web --watch-css
+python ./scripts/dev.py web --hot-reload
 ```
 
-This starts local Docker dependencies, the backend API, the frontend web app, and opens the frontend URL in your browser.
+This starts local Docker dependencies, the backend API, the frontend web app with Razor hot reload, and opens the frontend URL in your browser.
 On Windows, the CLI will also try to launch Docker Desktop automatically if it is installed but not already running, trust the local .NET HTTPS development certificate, export localhost TLS material for Keycloak and local PostgreSQL, create a local TLS certificate for Mailpit, and launch the local web stack on secure endpoints. The browser-facing services run on HTTPS, local PostgreSQL connections are TLS-enforced, and Keycloak verification emails are captured locally in Mailpit at [`https://localhost:8025`](https://localhost:8025).
 
 Quick start (backend API + local PostgreSQL + Keycloak only):
@@ -83,11 +83,12 @@ Examples:
 ```bash
 python ./scripts/dev.py doctor
 python ./scripts/dev.py bootstrap
-python ./scripts/dev.py web --watch-css
+python ./scripts/dev.py web --hot-reload
 python ./scripts/dev.py web-status
 python ./scripts/dev.py web-stop --down-dependencies
-python ./scripts/dev.py frontend --watch-css
+python ./scripts/dev.py frontend --hot-reload
 python ./scripts/dev.py up
+python ./scripts/dev.py all-tests
 python ./scripts/dev.py verify --skip-contract-tests
 python ./scripts/dev.py api-lint
 python ./scripts/dev.py api-test --start-backend
