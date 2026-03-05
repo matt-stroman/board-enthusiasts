@@ -65,6 +65,10 @@ Status: in progress
   - top domain tabs (`Studios`, `Titles`, `Releases`, `Publishing`)
   - left contextual workflow menu
   - in-place workflow content switching without route changes for primary browse/manage tasks
+- deliver first in-place Studios workflow set:
+  - studio overview cards
+  - create studio form
+  - studio settings edit form for the active studio context
 - test gate:
   - frontend route smoke tests cover player onboarding and developer shell markers
 
@@ -90,12 +94,31 @@ Status: in progress
 
 Status: planned
 
+### Chunk 1: Player Library And Wishlist Foundation
+
+- reintroduce player-owned library projections backed by entitlement-ready schema
+- implement authenticated player wishlist CRUD surface and persistence
+- restore player-library and wishlist contract coverage that was removed from active-wave delivery
+- test gate:
+  - contract tests for player library and wishlist endpoints
+  - backend integration tests for wishlist persistence and player scoping
+
+### Chunk 2: Commerce Abstractions And Purchase Flow
+
 - purchase orchestration abstractions across external providers
-- durable entitlement model that drives ownership in player library surfaces
-- event/audit trail for purchase and entitlement transitions
+- provider capability mapping and normalized purchase-attempt lifecycle
 - test gate:
   - provider-agnostic contract tests
+  - unit tests for purchase-state transitions
+
+### Chunk 3: Entitlements And Ownership Read Models
+
+- durable entitlement model that drives ownership in player library surfaces
+- player-owned read models for owned titles, acquisition source metadata, and fulfillment state
+- event/audit trail for purchase and entitlement transitions
+- test gate:
   - entitlement consistency integration tests
+  - projection/read-model regression tests for library ownership views
 
 ## Wave 9: Board Install And Delivery
 

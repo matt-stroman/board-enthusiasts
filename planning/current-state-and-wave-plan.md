@@ -55,8 +55,8 @@ Not yet implemented:
 
 - authenticated player library read models and personalization
 - private player wishlist management
-- Wave 7 unified commerce and entitlements
-- Wave 8 Board install-delivery flows
+- Wave 8 unified commerce and entitlements
+- Wave 9 Board install-delivery flows
 - configured Keycloak brokers for social/game platform SSO in the local realm import
 
 Because those later items are not implemented, they should not remain in the maintained current API contract unless they are being actively delivered in the same wave with tests first.
@@ -118,6 +118,7 @@ Wave 7 behavior being delivered includes:
 - keep `/develop` as a shared player/developer entry where players can self-enable developer access
 - show minimal onboarding UX on `/develop` for player-only accounts
 - render developer console workflows in-place on `/develop` with top domain tabs and contextual side navigation
+- expand the Studios workflow with in-place studio overview, create, and settings mutation flows (no primary route change required)
 - add `/moderate` workspace plus a header-level `Moderate` nav item shown only for moderator-role users
 - mirror the same workflow-shell pattern between `/develop` and `/moderate` for consistent navigation
 - wire frontend moderation actions to existing verified-developer role mutation endpoints
@@ -126,7 +127,9 @@ Wave 7 behavior being delivered includes:
 
 Player library foundation, unified commerce, and entitlements.
 
-This wave should introduce player-owned library read models, wishlist state, and purchase/entitlement modeling before Board-native install delivery.
+This wave must introduce player-owned library read models and wishlist state with explicit contract and integration test gates before purchase orchestration and entitlement-state delivery.
+
+Teams should treat player library and wishlist scope as mandatory Wave 8 entry criteria, not optional follow-on work.
 
 ## Schema And Identity Boundary
 
