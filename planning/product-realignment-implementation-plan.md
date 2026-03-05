@@ -21,6 +21,8 @@ Status: in progress
 - OpenAPI + Postman contract updates for:
   - `GET|POST /identity/me/developer-enrollment`
   - `PUT|DELETE /moderation/developers/{developerSubject}/verified-developer`
+- maintain role-catalog contract alignment for the six current platform roles:
+  - `player`, `developer`, `verified_developer`, `super_admin`, `admin`, `moderator`
 - remove deprecated enrollment workflow, conversation, attachment, and notification contract paths
 - test gate:
   - contract lint passes
