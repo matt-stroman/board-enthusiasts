@@ -581,8 +581,15 @@ def ensure_dotnet_dev_certificate_trusted() -> None:
     """
 
     assert_command_available("dotnet")
+    supports_trust = sys.platform.startswith("win") or sys.platform == "darwin"
     check = run_command(
-        ["dotnet", "dev-certs", "https", "--check", "--trust"],
+        [
+            "dotnet",
+            "dev-certs",
+            "https",
+            "--check",
+            *(["--trust"] if supports_trust else []),
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -590,8 +597,13 @@ def ensure_dotnet_dev_certificate_trusted() -> None:
     if check.returncode == 0:
         return
 
-    write_step("Trusting the .NET HTTPS development certificate")
-    run_command(["dotnet", "dev-certs", "https", "--trust"], check=True, capture_output=False, text=True)
+    if supports_trust:
+        write_step("Trusting the .NET HTTPS development certificate")
+        run_command(["dotnet", "dev-certs", "https", "--trust"], check=True, capture_output=False, text=True)
+        return
+
+    write_step("Ensuring the .NET HTTPS development certificate exists")
+    run_command(["dotnet", "dev-certs", "https"], check=True, capture_output=False, text=True)
 
 
 def ensure_keycloak_https_certificate_exported(config: DevConfig) -> Path:
