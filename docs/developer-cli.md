@@ -32,6 +32,7 @@ The developer CLI orchestrates common local development tasks from the repositor
 - run the backend API
 - validate backend XML documentation coverage
 - run backend tests
+- run all major validation checks in one pass (backend docs + backend/frontend tests + API lint + API contract)
 - authenticate Postman CLI when Postman workspace or mock operations are needed
 - lint the Git-tracked OpenAPI specification with Redocly CLI
 - run API contract tests
@@ -53,10 +54,10 @@ python ./scripts/dev.py <command> [options]
 
 ```bash
 python ./scripts/dev.py bootstrap
-python ./scripts/dev.py web --watch-css
+python ./scripts/dev.py web --hot-reload
 ```
 
-This starts Docker dependencies, the backend API, the frontend web app, and then opens the frontend URL in your default browser. On Windows, if Docker Desktop is installed but not already running, the CLI will try to launch it automatically and wait for the daemon before continuing. The root workflow is HTTPS-first for frontend, backend, Keycloak, and the local Mailpit UI, and it also exports TLS material for the local PostgreSQL container and Mailpit SMTP STARTTLS. It will launch the frontend at `https://localhost:7277`, the backend at `https://localhost:7085`, Keycloak at `https://localhost:8443`, and Mailpit at `https://localhost:8025`, while local PostgreSQL rejects non-TLS TCP connections.
+This starts Docker dependencies, the backend API, the frontend web app with Razor hot reload, and then opens the frontend URL in your default browser. On Windows, if Docker Desktop is installed but not already running, the CLI will try to launch it automatically and wait for the daemon before continuing. The root workflow is HTTPS-first for frontend, backend, Keycloak, and the local Mailpit UI, and it also exports TLS material for the local PostgreSQL container and Mailpit SMTP STARTTLS. It will launch the frontend at `https://localhost:7277`, the backend at `https://localhost:7085`, Keycloak at `https://localhost:8443`, and Mailpit at `https://localhost:8025`, while local PostgreSQL rejects non-TLS TCP connections.
 
 Local registration and verification emails are captured in Mailpit:
 
@@ -67,7 +68,7 @@ https://localhost:8025
 If you only want to run the frontend from the root workspace:
 
 ```bash
-python ./scripts/dev.py frontend --watch-css
+python ./scripts/dev.py frontend --hot-reload
 ```
 
 If you want to run API contract tests from the same terminal session without manually keeping the backend open, use:
@@ -80,12 +81,14 @@ python ./scripts/dev.py api-test --start-backend --skip-lint
 
 ```bash
 python ./scripts/dev.py web
-python ./scripts/dev.py web --watch-css
+python ./scripts/dev.py web --hot-reload
 ```
+
+The frontend part of this workflow now runs through `dotnet watch`, so `.razor`, `.cs`, and other supported web-app edits hot reload without restarting the stack. `--hot-reload` also starts live Tailwind rebuilds.
 
 Useful flags:
 
-- `--watch-css`
+- `--hot-reload`
 - `--no-browser`
 - `--skip-backend-restore`
 - `--skip-npm-install`
@@ -114,12 +117,14 @@ python ./scripts/dev.py up --dependencies-only
 
 ```bash
 python ./scripts/dev.py frontend
-python ./scripts/dev.py frontend --watch-css
+python ./scripts/dev.py frontend --hot-reload
 ```
+
+This standalone frontend workflow also uses `dotnet watch` for Razor hot reload.
 
 Useful flags:
 
-- `--watch-css`
+- `--hot-reload`
 - `--skip-npm-install`
 - `--skip-css-build`
 - `--skip-restore`
@@ -142,6 +147,20 @@ python ./scripts/dev.py status
 ```bash
 python ./scripts/dev.py test
 python ./scripts/dev.py test --skip-integration
+```
+
+### Run one-stop full validation
+
+```bash
+python ./scripts/dev.py all-tests
+```
+
+This command runs backend XML docs validation, backend unit/integration tests, frontend tests, OpenAPI lint, and API contract tests in one pass.
+
+If you are already running the API manually:
+
+```bash
+python ./scripts/dev.py all-tests --no-start-backend
 ```
 
 ### Run the main repository verification workflow
@@ -274,10 +293,10 @@ API workflow commands also expose workflow-specific overrides. Common examples:
 - `api-lint`
 - `api-mock --mode shared|ephemeral`
 - `api-sync --skip-mock`
-- `web --watch-css`
+- `web --hot-reload`
 - `web-status`
 - `web-stop --down-dependencies`
-- `frontend --watch-css`
+- `frontend --hot-reload`
 
 For live API contract execution, the default environment template is:
 
