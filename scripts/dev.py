@@ -110,6 +110,7 @@ MAILPIT_SERVER_KEY_RELATIVE_PATH = "backend/mailpit/certs/server.key"
 POSTGRES_SERVER_CERT_RELATIVE_PATH = "backend/postgres/certs/server.crt"
 POSTGRES_SERVER_KEY_RELATIVE_PATH = "backend/postgres/certs/server.key"
 REDOCLY_CLI_VERSION = "2.20.3"
+KEYCLOAK_READY_TIMEOUT_SECONDS = 240
 
 
 def get_web_stack_state_path(config: DevConfig) -> Path:
@@ -1245,7 +1246,11 @@ def start_dependencies(config: DevConfig) -> None:
         write_step("Starting Keycloak via docker compose")
         invoke_docker_compose(config, ["up", "-d", "keycloak"])
 
-    wait_for_http_ready(url=config.keycloak_ready_url, description="Keycloak")
+    wait_for_http_ready(
+        url=config.keycloak_ready_url,
+        description="Keycloak",
+        timeout_seconds=KEYCLOAK_READY_TIMEOUT_SECONDS,
+    )
 
 
 def stop_dependencies(config: DevConfig) -> None:
