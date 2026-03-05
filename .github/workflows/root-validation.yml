@@ -97,6 +97,9 @@ jobs:
         with:
           global-json-file: ./backend/global.json
 
+      - name: Restore backend solution
+        run: dotnet restore ./backend/Board.ThirdPartyLibrary.Backend.sln
+
       - name: Install Postman CLI
         run: npm install -g postman-cli@1.29.5
 
