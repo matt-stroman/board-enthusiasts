@@ -37,7 +37,8 @@ Status: in progress
 
 ### Chunk 3: Frontend Realignment
 
-- implement self-service “Become a Developer” user action in account settings and developer-access UX
+- implement self-service “Become a Developer” user action in account settings and the `/develop` gate experience
+- remove deprecated dedicated `/account/developer-access` route and menu entry in favor of a single activation surface on `/develop`
 - remove deprecated workflow UI paths (notifications, request queue, conversation/reply/cancel screens)
 - defer moderator/admin UI surfaces until dedicated product UX decisions are finalized
 - test gate:
