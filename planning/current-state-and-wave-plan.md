@@ -43,13 +43,14 @@ As of March 5, 2026, the maintained implemented surface is:
 
 - health endpoints: `/`, `/health/live`, `/health/ready`
 - Keycloak-backed identity endpoints: `/identity/roles`, `/identity/auth/config`, `/identity/auth/login`, `/identity/auth/callback`, `/identity/me`, `GET|POST /identity/me/developer-enrollment`, and `GET|PUT|DELETE /identity/me/board-profile`
-- moderation endpoints: `PUT|DELETE /moderation/developers/{developerSubject}/verified-developer`
+- moderation endpoints: `GET /moderation/developers`, `GET /moderation/developers/{developerIdentifier}/verification`, and `PUT|DELETE /moderation/developers/{developerSubject}/verified-developer`
 - organization endpoints: public `GET /organizations`, public `GET /organizations/{slug}`, authenticated `POST|PUT|DELETE /organizations...`, and authenticated membership management endpoints
 - catalog endpoints: public `GET /catalog`, public `GET /catalog/{organizationSlug}/{titleSlug}`, authenticated title/metadata management endpoints, authenticated media/release/artifact management endpoints, public `GET /supported-publishers`, and authenticated connection/acquisition-binding management endpoints
 - EF Core persistence with migrations for `users`, `user_board_profiles`, `organizations`, `organization_memberships`, `titles`, `title_metadata_versions`, `title_media_assets`, `title_releases`, `release_artifacts`, `supported_publishers`, `integration_connections`, and `title_integration_bindings`
 - Postman mock-first contract assets for the above endpoints
 - backend endpoint unit tests plus Postgres-backed integration coverage for persistence and constraints
 - developer automation for local bootstrap, Docker dependencies, and test execution
+- deterministic local seed automation via `python ./scripts/dev.py seed-data`
 
 Not yet implemented:
 
@@ -121,7 +122,8 @@ Wave 7 behavior being delivered includes:
 - expand the Studios workflow with in-place studio overview, create, and settings mutation flows (no primary route change required)
 - add `/moderate` workspace plus a header-level `Moderate` nav item shown only for moderator-role users
 - mirror the same workflow-shell pattern between `/develop` and `/moderate` for consistent navigation
-- wire frontend moderation actions to existing verified-developer role mutation endpoints
+- wire moderation workspace to user-directory + verification-state APIs with fuzzy account selection and a single verified toggle workflow
+- normalize workspace shell layout behavior across `/player`, `/develop`, and `/moderate`
 
 ### Wave 8 (planned)
 

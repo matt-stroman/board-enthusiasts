@@ -14,6 +14,7 @@ This script is the primary developer automation entry point for:
   with optional backend auto-start for local contract runs
 - environment diagnostics (`doctor`)
 - local PostgreSQL backup/restore helpers (`db-backup`, `db-restore`)
+- deterministic local auth/catalog sample data seeding (`seed-data`)
 
 Use `python ./scripts/dev.py --help` and `python ./scripts/dev.py <command> --help`
 for command-specific help.
@@ -22,6 +23,7 @@ for command-specific help.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import json
 import os
@@ -29,17 +31,20 @@ import shlex
 import shutil
 import signal
 import ssl
+import struct
 import subprocess
 import sys
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 
 @dataclass(frozen=True)
@@ -2706,6 +2711,1130 @@ def db_restore(config: DevConfig, *, input_path: Path) -> None:
     print("Restore complete.")
 
 
+LOCAL_KEYCLOAK_ADMIN_USERNAME = "admin"
+LOCAL_KEYCLOAK_ADMIN_PASSWORD = "admin"
+LOCAL_KEYCLOAK_DEFAULT_REALM = "board-third-party-library"
+LOCAL_SEED_DEFAULT_PASSWORD = "ChangeMe!123"
+LOCAL_SEED_IMAGE_BASE_PATH = Path("frontend/src/Board.ThirdPartyLibrary.Frontend.Web/wwwroot/test-images/generated")
+
+
+@dataclass(frozen=True)
+class LocalSeedUser:
+    """Represents a deterministic local auth + profile seed user."""
+
+    username: str
+    first_name: str
+    last_name: str
+    roles: tuple[str, ...]
+
+    @property
+    def display_name(self) -> str:
+        return f"{self.first_name} {self.last_name}"
+
+    @property
+    def email(self) -> str:
+        return f"{self.username}@boardtpl.local"
+
+
+@dataclass(frozen=True)
+class LocalSeedStudio:
+    """Represents a deterministic studio used for local UX seed data."""
+
+    slug: str
+    display_name: str
+    description: str
+    owner_username: str
+
+
+def seed_local_data(config: DevConfig, *, reset_media: bool, seed_password: str) -> None:
+    """Populate local Keycloak and PostgreSQL with deterministic Wave 7 sample data.
+
+    Args:
+        config: CLI configuration for local containers and paths.
+        reset_media: Whether to clear generated test images before regenerating.
+        seed_password: Password assigned to seeded local Keycloak users.
+
+    Returns:
+        None.
+
+    Raises:
+        DevCliError: If dependencies are unavailable or seed operations fail.
+    """
+
+    assert_command_available("docker")
+    ensure_postgres_running_for_db_ops(config)
+    ensure_keycloak_running_for_seed(config)
+
+    keycloak_base_url, keycloak_realm = resolve_keycloak_seed_context(config)
+    write_step(f"Preparing local auth seed in Keycloak realm '{keycloak_realm}'")
+    admin_access_token = get_keycloak_admin_access_token(
+        keycloak_base_url=keycloak_base_url,
+        admin_username=LOCAL_KEYCLOAK_ADMIN_USERNAME,
+        admin_password=LOCAL_KEYCLOAK_ADMIN_PASSWORD,
+    )
+
+    users = build_local_seed_users()
+    managed_role_names = sorted(
+        {
+            "player",
+            "developer",
+            "verified_developer",
+            "super_admin",
+            "admin",
+            "moderator",
+            *(role for user in users for role in user.roles),
+        },
+        key=str.casefold,
+    )
+    ensure_keycloak_realm_roles(
+        keycloak_base_url=keycloak_base_url,
+        keycloak_realm=keycloak_realm,
+        admin_access_token=admin_access_token,
+        role_names=managed_role_names,
+    )
+    role_representations = {
+        role_name: get_keycloak_realm_role(
+            keycloak_base_url=keycloak_base_url,
+            keycloak_realm=keycloak_realm,
+            admin_access_token=admin_access_token,
+            role_name=role_name,
+        )
+        for role_name in managed_role_names
+    }
+
+    seeded_user_subjects: dict[str, str] = {}
+    for user in users:
+        user_subject = upsert_keycloak_user(
+            keycloak_base_url=keycloak_base_url,
+            keycloak_realm=keycloak_realm,
+            admin_access_token=admin_access_token,
+            user=user,
+            user_password=seed_password,
+            role_representations=role_representations,
+            managed_role_names=managed_role_names,
+        )
+        seeded_user_subjects[user.username] = user_subject
+
+    write_step("Generating local catalog media assets")
+    studios = build_local_seed_studios()
+    titles = build_local_seed_titles(studios)
+    media_root = (config.repo_root / LOCAL_SEED_IMAGE_BASE_PATH).resolve()
+    generate_local_seed_media_assets(titles=titles, media_root=media_root, reset_media=reset_media)
+
+    write_step("Populating PostgreSQL seed data")
+    sql_script = build_local_seed_sql_script(
+        users=users,
+        user_subjects=seeded_user_subjects,
+        studios=studios,
+        titles=titles,
+    )
+    execute_postgres_sql(config, sql_script)
+
+    print("Local seed data is ready.")
+    print("Seed users use password:", seed_password)
+    print("Generated media root:", media_root)
+
+
+def ensure_keycloak_running_for_seed(config: DevConfig) -> None:
+    """Ensure Keycloak is running and reachable before seed operations.
+
+    Args:
+        config: CLI configuration containing Keycloak container settings.
+
+    Returns:
+        None.
+
+    Raises:
+        DevCliError: If Keycloak is unavailable.
+    """
+
+    keycloak_state = get_docker_container_state(config.keycloak_container_name)
+    if keycloak_state != "running":
+        raise DevCliError(
+            f"Keycloak container '{config.keycloak_container_name}' is not running. "
+            "Start dependencies first with 'python ./scripts/dev.py up --dependencies-only'."
+        )
+
+    wait_for_http_ready(
+        url=config.keycloak_ready_url,
+        description="Keycloak",
+        timeout_seconds=KEYCLOAK_READY_TIMEOUT_SECONDS,
+    )
+
+
+def resolve_keycloak_seed_context(config: DevConfig) -> tuple[str, str]:
+    """Resolve the local Keycloak base URL and realm from CLI configuration.
+
+    Args:
+        config: CLI configuration.
+
+    Returns:
+        Tuple of ``(base_url, realm_name)``.
+    """
+
+    parsed = urllib.parse.urlparse(config.keycloak_ready_url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if len(path_parts) >= 2 and path_parts[0] == "realms":
+        return base_url, path_parts[1]
+    return base_url, LOCAL_KEYCLOAK_DEFAULT_REALM
+
+
+def keycloak_admin_request(
+    *,
+    keycloak_base_url: str,
+    path: str,
+    method: str,
+    admin_access_token: str,
+    payload: dict[str, Any] | list[dict[str, Any]] | None = None,
+    expect_json: bool = True,
+    allow_not_found: bool = False,
+) -> Any | None:
+    """Invoke the Keycloak admin API with local TLS relaxation.
+
+    Args:
+        keycloak_base_url: Keycloak base URL.
+        path: Admin path starting with ``/``.
+        method: HTTP method.
+        admin_access_token: Admin bearer token.
+        payload: Optional JSON payload.
+        expect_json: Whether to parse the response payload as JSON.
+        allow_not_found: Whether HTTP 404 should return ``None``.
+
+    Returns:
+        Parsed JSON payload, raw text payload, or ``None``.
+
+    Raises:
+        DevCliError: If the admin API returns an error.
+    """
+
+    url = f"{keycloak_base_url.rstrip('/')}{path}"
+    request_headers = {
+        "Authorization": f"Bearer {admin_access_token}",
+        "Accept": "application/json",
+    }
+    body: bytes | None = None
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        request_headers["Content-Type"] = "application/json"
+
+    request = urllib.request.Request(url, method=method, data=body, headers=request_headers)
+    context = ssl._create_unverified_context()
+
+    try:
+        with urllib.request.urlopen(request, context=context, timeout=30) as response:
+            raw = response.read()
+            if not raw:
+                return None
+            if expect_json:
+                return json.loads(raw.decode("utf-8"))
+            return raw.decode("utf-8")
+    except urllib.error.HTTPError as ex:
+        if allow_not_found and ex.code == 404:
+            return None
+
+        error_payload = ex.read().decode("utf-8", errors="replace").strip()
+        detail = f"HTTP {ex.code} {ex.reason}"
+        if error_payload:
+            detail = f"{detail}: {error_payload}"
+        raise DevCliError(f"Keycloak admin request failed ({method} {path}). {detail}") from ex
+    except urllib.error.URLError as ex:
+        raise DevCliError(f"Keycloak admin request failed ({method} {path}). {ex}") from ex
+
+
+def get_keycloak_admin_access_token(*, keycloak_base_url: str, admin_username: str, admin_password: str) -> str:
+    """Acquire a Keycloak admin token from the local master realm.
+
+    Args:
+        keycloak_base_url: Keycloak base URL.
+        admin_username: Keycloak admin username.
+        admin_password: Keycloak admin password.
+
+    Returns:
+        Access token string.
+
+    Raises:
+        DevCliError: If token acquisition fails.
+    """
+
+    token_url = f"{keycloak_base_url.rstrip('/')}/realms/master/protocol/openid-connect/token"
+    payload = urllib.parse.urlencode(
+        {
+            "grant_type": "password",
+            "client_id": "admin-cli",
+            "username": admin_username,
+            "password": admin_password,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        token_url,
+        method="POST",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    context = ssl._create_unverified_context()
+
+    try:
+        with urllib.request.urlopen(request, context=context, timeout=30) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as ex:
+        detail = ex.read().decode("utf-8", errors="replace").strip()
+        raise DevCliError(f"Keycloak admin token request failed: HTTP {ex.code} {ex.reason}. {detail}") from ex
+    except urllib.error.URLError as ex:
+        raise DevCliError(f"Keycloak admin token request failed: {ex}") from ex
+
+    access_token = body.get("access_token")
+    if not isinstance(access_token, str) or not access_token.strip():
+        raise DevCliError("Keycloak admin token response did not include access_token.")
+    return access_token
+
+
+def ensure_keycloak_realm_roles(
+    *,
+    keycloak_base_url: str,
+    keycloak_realm: str,
+    admin_access_token: str,
+    role_names: Sequence[str],
+) -> None:
+    """Ensure required realm roles exist for local seed users.
+
+    Args:
+        keycloak_base_url: Keycloak base URL.
+        keycloak_realm: Realm name.
+        admin_access_token: Admin bearer token.
+        role_names: Role names that must exist.
+
+    Returns:
+        None.
+    """
+
+    for role_name in role_names:
+        existing = keycloak_admin_request(
+            keycloak_base_url=keycloak_base_url,
+            path=f"/admin/realms/{urllib.parse.quote(keycloak_realm, safe='')}/roles/{urllib.parse.quote(role_name, safe='')}",
+            method="GET",
+            admin_access_token=admin_access_token,
+            allow_not_found=True,
+        )
+        if existing is not None:
+            continue
+
+        keycloak_admin_request(
+            keycloak_base_url=keycloak_base_url,
+            path=f"/admin/realms/{urllib.parse.quote(keycloak_realm, safe='')}/roles",
+            method="POST",
+            admin_access_token=admin_access_token,
+            payload={"name": role_name, "description": f"Seeded role '{role_name}' for local development."},
+            expect_json=False,
+        )
+
+
+def get_keycloak_realm_role(
+    *,
+    keycloak_base_url: str,
+    keycloak_realm: str,
+    admin_access_token: str,
+    role_name: str,
+) -> dict[str, Any]:
+    """Fetch a realm role representation from Keycloak.
+
+    Args:
+        keycloak_base_url: Keycloak base URL.
+        keycloak_realm: Realm name.
+        admin_access_token: Admin bearer token.
+        role_name: Role name to fetch.
+
+    Returns:
+        Role representation payload.
+
+    Raises:
+        DevCliError: If the payload is invalid.
+    """
+
+    role = keycloak_admin_request(
+        keycloak_base_url=keycloak_base_url,
+        path=f"/admin/realms/{urllib.parse.quote(keycloak_realm, safe='')}/roles/{urllib.parse.quote(role_name, safe='')}",
+        method="GET",
+        admin_access_token=admin_access_token,
+    )
+    if not isinstance(role, dict) or "name" not in role:
+        raise DevCliError(f"Keycloak returned an invalid role representation for '{role_name}'.")
+    return role
+
+
+def upsert_keycloak_user(
+    *,
+    keycloak_base_url: str,
+    keycloak_realm: str,
+    admin_access_token: str,
+    user: LocalSeedUser,
+    user_password: str,
+    role_representations: dict[str, dict[str, Any]],
+    managed_role_names: Sequence[str],
+) -> str:
+    """Create or update a deterministic local Keycloak user and role mapping.
+
+    Args:
+        keycloak_base_url: Keycloak base URL.
+        keycloak_realm: Realm name.
+        admin_access_token: Admin bearer token.
+        user: User spec to apply.
+        user_password: Password assigned to the user.
+        role_representations: Map of role name to Keycloak role payload.
+        managed_role_names: Role names controlled by this seeding workflow.
+
+    Returns:
+        User subject identifier.
+    """
+
+    encoded_realm = urllib.parse.quote(keycloak_realm, safe="")
+    encoded_username = urllib.parse.quote(user.username, safe="")
+    existing_users = keycloak_admin_request(
+        keycloak_base_url=keycloak_base_url,
+        path=f"/admin/realms/{encoded_realm}/users?username={encoded_username}&exact=true",
+        method="GET",
+        admin_access_token=admin_access_token,
+    )
+    if not isinstance(existing_users, list):
+        raise DevCliError(f"Unexpected Keycloak user lookup payload for '{user.username}'.")
+
+    user_payload = {
+        "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/users/{user.username}")),
+        "username": user.username,
+        "enabled": True,
+        "firstName": user.first_name,
+        "lastName": user.last_name,
+        "email": user.email,
+        "emailVerified": True,
+    }
+
+    if existing_users:
+        keycloak_user_id = existing_users[0].get("id")
+        if not isinstance(keycloak_user_id, str) or not keycloak_user_id.strip():
+            raise DevCliError(f"Keycloak user lookup returned an invalid ID for '{user.username}'.")
+
+        keycloak_admin_request(
+            keycloak_base_url=keycloak_base_url,
+            path=f"/admin/realms/{encoded_realm}/users/{urllib.parse.quote(keycloak_user_id, safe='')}",
+            method="PUT",
+            admin_access_token=admin_access_token,
+            payload={**user_payload, "id": keycloak_user_id},
+            expect_json=False,
+        )
+    else:
+        keycloak_admin_request(
+            keycloak_base_url=keycloak_base_url,
+            path=f"/admin/realms/{encoded_realm}/users",
+            method="POST",
+            admin_access_token=admin_access_token,
+            payload=user_payload,
+            expect_json=False,
+        )
+        refreshed_users = keycloak_admin_request(
+            keycloak_base_url=keycloak_base_url,
+            path=f"/admin/realms/{encoded_realm}/users?username={encoded_username}&exact=true",
+            method="GET",
+            admin_access_token=admin_access_token,
+        )
+        if not isinstance(refreshed_users, list) or not refreshed_users:
+            raise DevCliError(f"Keycloak user '{user.username}' was created but could not be reloaded.")
+        keycloak_user_id = refreshed_users[0].get("id")
+        if not isinstance(keycloak_user_id, str) or not keycloak_user_id.strip():
+            raise DevCliError(f"Keycloak user lookup returned an invalid ID for '{user.username}'.")
+
+    keycloak_admin_request(
+        keycloak_base_url=keycloak_base_url,
+        path=f"/admin/realms/{encoded_realm}/users/{urllib.parse.quote(keycloak_user_id, safe='')}/reset-password",
+        method="PUT",
+        admin_access_token=admin_access_token,
+        payload={
+            "type": "password",
+            "temporary": False,
+            "value": user_password,
+        },
+        expect_json=False,
+    )
+
+    current_roles = keycloak_admin_request(
+        keycloak_base_url=keycloak_base_url,
+        path=f"/admin/realms/{encoded_realm}/users/{urllib.parse.quote(keycloak_user_id, safe='')}/role-mappings/realm",
+        method="GET",
+        admin_access_token=admin_access_token,
+    )
+    if not isinstance(current_roles, list):
+        raise DevCliError(f"Unexpected role payload returned for '{user.username}'.")
+
+    current_role_names = {
+        role.get("name")
+        for role in current_roles
+        if isinstance(role, dict) and isinstance(role.get("name"), str)
+    }
+    desired_role_names = set(user.roles)
+    managed_role_set = set(managed_role_names)
+    roles_to_remove = sorted((current_role_names & managed_role_set) - desired_role_names, key=str.casefold)
+    roles_to_add = sorted(desired_role_names - current_role_names, key=str.casefold)
+
+    if roles_to_remove:
+        keycloak_admin_request(
+            keycloak_base_url=keycloak_base_url,
+            path=f"/admin/realms/{encoded_realm}/users/{urllib.parse.quote(keycloak_user_id, safe='')}/role-mappings/realm",
+            method="DELETE",
+            admin_access_token=admin_access_token,
+            payload=[role_representations[role_name] for role_name in roles_to_remove],
+            expect_json=False,
+        )
+
+    if roles_to_add:
+        keycloak_admin_request(
+            keycloak_base_url=keycloak_base_url,
+            path=f"/admin/realms/{encoded_realm}/users/{urllib.parse.quote(keycloak_user_id, safe='')}/role-mappings/realm",
+            method="POST",
+            admin_access_token=admin_access_token,
+            payload=[role_representations[role_name] for role_name in roles_to_add],
+            expect_json=False,
+        )
+
+    return keycloak_user_id
+
+
+def build_local_seed_users() -> list[LocalSeedUser]:
+    """Build deterministic local seed users across platform access levels.
+
+    Returns:
+        Ordered local seed user list.
+    """
+
+    return [
+        LocalSeedUser("alex.rivera", "Alex", "Rivera", ("player", "moderator", "admin", "super_admin")),
+        LocalSeedUser("morgan.lee", "Morgan", "Lee", ("player", "admin")),
+        LocalSeedUser("samir.khan", "Samir", "Khan", ("player", "admin")),
+        LocalSeedUser("jordan.ellis", "Jordan", "Ellis", ("player", "moderator")),
+        LocalSeedUser("casey.nguyen", "Casey", "Nguyen", ("player", "moderator")),
+        LocalSeedUser("riley.patel", "Riley", "Patel", ("player", "moderator")),
+        LocalSeedUser("emma.torres", "Emma", "Torres", ("player", "developer", "verified_developer")),
+        LocalSeedUser("liam.chen", "Liam", "Chen", ("player", "developer", "verified_developer")),
+        LocalSeedUser("noah.walters", "Noah", "Walters", ("player", "developer", "verified_developer")),
+        LocalSeedUser("maya.singh", "Maya", "Singh", ("player", "developer", "verified_developer")),
+        LocalSeedUser("olivia.bennett", "Olivia", "Bennett", ("player", "developer")),
+        LocalSeedUser("ethan.foster", "Ethan", "Foster", ("player", "developer")),
+        LocalSeedUser("amelia.park", "Amelia", "Park", ("player", "developer")),
+        LocalSeedUser("lucas.hughes", "Lucas", "Hughes", ("player", "developer")),
+        LocalSeedUser("zoe.martin", "Zoe", "Martin", ("player", "developer")),
+        LocalSeedUser("isaac.romero", "Isaac", "Romero", ("player", "developer")),
+        LocalSeedUser("ava.garcia", "Ava", "Garcia", ("player",)),
+        LocalSeedUser("mia.collins", "Mia", "Collins", ("player",)),
+        LocalSeedUser("nora.bailey", "Nora", "Bailey", ("player",)),
+        LocalSeedUser("owen.brooks", "Owen", "Brooks", ("player",)),
+    ]
+
+
+def build_local_seed_studios() -> list[LocalSeedStudio]:
+    """Build deterministic studios for local UX data validation.
+
+    Returns:
+        Ordered studio list.
+    """
+
+    return [
+        LocalSeedStudio("blue-harbor-games", "Blue Harbor Games", "Co-op adventures with bright maritime themes and approachable controls.", "emma.torres"),
+        LocalSeedStudio("pine-lantern-labs", "Pine Lantern Labs", "Narrative puzzle team focused on campfire mystery and family play.", "emma.torres"),
+        LocalSeedStudio("quartz-rabbit-studio", "Quartz Rabbit Studio", "Fast-action arcade experiments with local and online score races.", "liam.chen"),
+        LocalSeedStudio("north-maple-interactive", "North Maple Interactive", "Strategic board-inspired designs for quick sessions and tournaments.", "noah.walters"),
+        LocalSeedStudio("copper-finch-works", "Copper Finch Works", "Whimsical creature sims and cozy exploration for all ages.", "maya.singh"),
+        LocalSeedStudio("lumen-cartography", "Lumen Cartography", "Tooling-led studio building companion apps and interactive map systems.", "olivia.bennett"),
+        LocalSeedStudio("tiny-orbit-forge", "Tiny Orbit Forge", "Sci-fi builders featuring modular crafting and community challenges.", "ethan.foster"),
+        LocalSeedStudio("moss-byte-collective", "Moss Byte Collective", "Experimental co-op projects mixing rhythm, puzzle, and narrative beats.", "amelia.park"),
+        LocalSeedStudio("harborlight-mechanics", "Harborlight Mechanics", "Competitive strategy and logistics play tuned for weekend sessions.", "lucas.hughes"),
+    ]
+
+
+def build_local_seed_titles(studios: Sequence[LocalSeedStudio]) -> list[dict[str, Any]]:
+    """Create deterministic title payloads with mixed genres, status, and imagery.
+
+    Args:
+        studios: Seed studios.
+
+    Returns:
+        List of title dictionaries ready for media generation and SQL emission.
+    """
+
+    genre_sets: list[tuple[str, ...]] = [
+        ("Strategy",),
+        ("Puzzle", "Family"),
+        ("Adventure", "Co-op", "Story Rich"),
+        ("Arcade", "Action", "Party"),
+        ("Simulation", "Building", "Management", "Sandbox"),
+        ("RPG", "Adventure", "Crafting", "Exploration", "Co-op"),
+        ("Rhythm", "Music"),
+        ("Educational", "Trivia", "Family"),
+        ("Productivity",),
+        ("Utility", "Creator Tools", "Automation", "Cloud", "Companion", "Modding"),
+    ]
+    title_nouns = [
+        "Signal Harbor",
+        "Lantern Drift",
+        "Solar Orchard",
+        "Compass Echo",
+        "Circuit Garden",
+        "Nebula Relay",
+        "Stonepath Rally",
+        "Clockwork Crew",
+        "Moonlight Ledger",
+        "Riverlight Quest",
+        "Parade of Sparks",
+        "Anchorpoint Atlas",
+        "Starlane Sprint",
+        "Fjord Frontier",
+        "Patchwork Port",
+        "Nightglass Tactics",
+        "Orbit Orchard",
+        "Marble Meridian",
+        "Signal Syndicate",
+        "Trailblazer Terminal",
+        "Cinderline Workshop",
+        "Mosaic Drift",
+        "Echo Harborline",
+        "Pioneer Broadcast",
+        "Cascade Courier",
+        "Festival Foundry",
+        "Beacon Boardwalk",
+        "Cloudline Studio",
+        "Cobalt Almanac",
+        "Hearthside Protocol",
+    ]
+    short_hooks = [
+        "Team up for short sessions with quick wins.",
+        "Build strategies and adapt to changing rounds.",
+        "Explore handcrafted spaces and unlock hidden routes.",
+        "Compete for high scores with simple controls.",
+        "Coordinate roles and manage shared resources.",
+    ]
+
+    seen_slugs: set[str] = set()
+    titles: list[dict[str, Any]] = []
+    title_index = 0
+
+    for studio_index, studio in enumerate(studios):
+        for local_index in range(3):
+            name = title_nouns[title_index % len(title_nouns)]
+            slug = slugify_for_seed(name)
+            while slug in seen_slugs:
+                slug = f"{slug}-{title_index + 1}"
+            seen_slugs.add(slug)
+
+            genre_set = genre_sets[(studio_index + local_index) % len(genre_sets)]
+            content_kind = "app" if title_index in {3, 11, 19, 25} else "game"
+            lifecycle_status = (
+                "draft" if title_index % 6 == 0 else
+                "testing" if title_index % 4 == 0 else
+                "published"
+            )
+            visibility = (
+                "private" if lifecycle_status == "draft" and title_index % 2 == 0 else
+                "unlisted" if lifecycle_status != "published" else
+                "listed"
+            )
+
+            min_players = 1 if content_kind == "app" else 1 + (title_index % 2)
+            max_players = min_players if content_kind == "app" else max(min_players + 1, min_players + (title_index % 4))
+            min_age_years = 6 + (title_index % 8)
+            age_rating_value = "E" if min_age_years <= 7 else "E10+" if min_age_years <= 11 else "T"
+
+            short_description = short_hooks[title_index % len(short_hooks)]
+            description = (
+                f"{name} by {studio.display_name} blends {', '.join(genre_set)} play with "
+                f"a polished progression loop designed for tabletop and digital fans. "
+                "Sessions scale for solo runs, couch groups, and rotating seasonal challenges."
+            )
+
+            titles.append(
+                {
+                    "title_index": title_index,
+                    "organization_slug": studio.slug,
+                    "display_name": name,
+                    "slug": slug,
+                    "content_kind": content_kind,
+                    "lifecycle_status": lifecycle_status,
+                    "visibility": visibility,
+                    "short_description": short_description,
+                    "description": description,
+                    "genre_display": ", ".join(genre_set),
+                    "min_players": min_players,
+                    "max_players": max_players,
+                    "age_rating_authority": "ESRB",
+                    "age_rating_value": age_rating_value,
+                    "min_age_years": min_age_years,
+                    "media_assignments": get_media_assignment_for_title(title_index),
+                }
+            )
+
+            title_index += 1
+
+    return titles
+
+
+def get_media_assignment_for_title(title_index: int) -> set[str]:
+    """Return assigned media roles for a title while preserving intentional gaps.
+
+    Args:
+        title_index: Zero-based title index.
+
+    Returns:
+        Assigned media role set.
+    """
+
+    assigned = {"card", "hero", "logo"}
+    if title_index % 4 == 0:
+        assigned.discard("logo")
+    if title_index % 6 == 0:
+        assigned.discard("hero")
+    if title_index % 9 == 0:
+        assigned.discard("card")
+    if not assigned:
+        assigned.add("card")
+    return assigned
+
+
+def slugify_for_seed(value: str) -> str:
+    """Normalize a display string into a kebab-case seed slug.
+
+    Args:
+        value: Source value.
+
+    Returns:
+        Kebab-case slug.
+    """
+
+    normalized = [
+        character.lower() if character.isalnum() else "-"
+        for character in value.strip()
+    ]
+    slug = "".join(normalized)
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug.strip("-")
+
+
+def generate_local_seed_media_assets(*, titles: Sequence[dict[str, Any]], media_root: Path, reset_media: bool) -> None:
+    """Generate deterministic PNG card/hero/logo assets for seed titles.
+
+    Args:
+        titles: Seed title payloads.
+        media_root: Output root path.
+        reset_media: Whether to clear existing generated assets.
+
+    Returns:
+        None.
+    """
+
+    if reset_media and media_root.exists():
+        shutil.rmtree(media_root)
+    media_root.mkdir(parents=True, exist_ok=True)
+
+    for title in titles:
+        title_slug = str(title["slug"])
+        title_directory = media_root / title_slug
+        title_directory.mkdir(parents=True, exist_ok=True)
+
+        primary_color, secondary_color, accent_color = derive_seed_palette(
+            f"{title['organization_slug']}::{title_slug}::{title['content_kind']}"
+        )
+        write_seed_png(
+            path=title_directory / "card.png",
+            width=640,
+            height=360,
+            primary_color=primary_color,
+            secondary_color=secondary_color,
+            accent_color=accent_color,
+        )
+        write_seed_png(
+            path=title_directory / "hero.png",
+            width=1200,
+            height=675,
+            primary_color=secondary_color,
+            secondary_color=primary_color,
+            accent_color=accent_color,
+        )
+        write_seed_png(
+            path=title_directory / "logo.png",
+            width=512,
+            height=512,
+            primary_color=accent_color,
+            secondary_color=primary_color,
+            accent_color=secondary_color,
+        )
+
+
+def derive_seed_palette(seed: str) -> tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]:
+    """Derive a deterministic color palette from a seed string.
+
+    Args:
+        seed: Seed key.
+
+    Returns:
+        Tuple of RGB colors for primary, secondary, and accent usage.
+    """
+
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+
+    def color(offset: int) -> tuple[int, int, int]:
+        red = 48 + digest[offset] % 160
+        green = 48 + digest[offset + 1] % 160
+        blue = 48 + digest[offset + 2] % 160
+        return red, green, blue
+
+    return color(0), color(3), color(6)
+
+
+def write_seed_png(
+    *,
+    path: Path,
+    width: int,
+    height: int,
+    primary_color: tuple[int, int, int],
+    secondary_color: tuple[int, int, int],
+    accent_color: tuple[int, int, int],
+) -> None:
+    """Write a deterministic RGB PNG with gradient + stripe accents.
+
+    Args:
+        path: Output image path.
+        width: Pixel width.
+        height: Pixel height.
+        primary_color: Primary RGB color.
+        secondary_color: Secondary RGB color.
+        accent_color: Accent RGB color.
+
+    Returns:
+        None.
+    """
+
+    if width <= 0 or height <= 0:
+        raise DevCliError("Image dimensions must be positive.")
+
+    row_bytes = bytearray()
+    stripe_width = max(8, width // 14)
+    stripe_offset = (accent_color[0] + accent_color[1] + accent_color[2]) % stripe_width
+
+    for y in range(height):
+        row_bytes.append(0)  # PNG filter type 0 (None).
+        vertical_mix = y / max(1, height - 1)
+        for x in range(width):
+            horizontal_mix = x / max(1, width - 1)
+            red = int(primary_color[0] * (1 - horizontal_mix) + secondary_color[0] * horizontal_mix)
+            green = int(primary_color[1] * (1 - vertical_mix) + secondary_color[1] * vertical_mix)
+            blue = int(primary_color[2] * (1 - horizontal_mix) + secondary_color[2] * horizontal_mix)
+
+            if ((x + stripe_offset) // stripe_width) % 3 == 0:
+                red = min(255, int((red + accent_color[0]) / 2) + 10)
+                green = min(255, int((green + accent_color[1]) / 2) + 6)
+                blue = min(255, int((blue + accent_color[2]) / 2) + 10)
+
+            row_bytes.extend((red, green, blue))
+
+    png_payload = bytearray()
+    png_payload.extend(b"\x89PNG\r\n\x1a\n")
+    png_payload.extend(make_png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)))
+    png_payload.extend(make_png_chunk(b"IDAT", zlib.compress(bytes(row_bytes), level=9)))
+    png_payload.extend(make_png_chunk(b"IEND", b""))
+
+    path.write_bytes(bytes(png_payload))
+
+
+def make_png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
+    """Build a PNG chunk with CRC metadata.
+
+    Args:
+        chunk_type: Four-byte chunk type.
+        payload: Chunk payload bytes.
+
+    Returns:
+        Encoded PNG chunk.
+    """
+
+    crc = zlib.crc32(chunk_type + payload) & 0xFFFFFFFF
+    return struct.pack(">I", len(payload)) + chunk_type + payload + struct.pack(">I", crc)
+
+
+def build_local_seed_sql_script(
+    *,
+    users: Sequence[LocalSeedUser],
+    user_subjects: dict[str, str],
+    studios: Sequence[LocalSeedStudio],
+    titles: Sequence[dict[str, Any]],
+) -> str:
+    """Build SQL script for deterministic local seed data insertion.
+
+    Args:
+        users: Seed users.
+        user_subjects: Map of username to Keycloak subject.
+        studios: Seed studios.
+        titles: Seed titles.
+
+    Returns:
+        SQL script text.
+    """
+
+    now = datetime.now(timezone.utc)
+    sql_lines = [
+        "BEGIN;",
+        "TRUNCATE TABLE release_artifacts, title_releases, title_media_assets, title_integration_bindings, integration_connections, title_metadata_versions, titles, organization_memberships, organizations, user_board_profiles RESTART IDENTITY CASCADE;",
+    ]
+
+    app_user_ids: dict[str, str] = {}
+    for user in users:
+        subject = user_subjects.get(user.username)
+        if not subject:
+            raise DevCliError(f"Missing Keycloak subject for seeded user '{user.username}'.")
+
+        app_user_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/app-users/{subject}"))
+        app_user_ids[user.username] = app_user_id
+        avatar_url = f"https://api.dicebear.com/9.x/initials/svg?seed={urllib.parse.quote(user.display_name, safe='')}"
+        sql_lines.append(
+            "INSERT INTO users (id, keycloak_subject, display_name, user_name, first_name, last_name, email, email_verified, identity_provider, avatar_url, avatar_image_content_type, avatar_image_data, created_at, updated_at) "
+            f"VALUES ({sql_literal(app_user_id)}, {sql_literal(subject)}, {sql_literal(user.display_name)}, {sql_literal(user.username)}, {sql_literal(user.first_name)}, {sql_literal(user.last_name)}, {sql_literal(user.email)}, TRUE, 'keycloak', {sql_literal(avatar_url)}, NULL, NULL, {sql_literal(now)}, {sql_literal(now)}) "
+            "ON CONFLICT (keycloak_subject) DO UPDATE SET "
+            "display_name = EXCLUDED.display_name, "
+            "user_name = EXCLUDED.user_name, "
+            "first_name = EXCLUDED.first_name, "
+            "last_name = EXCLUDED.last_name, "
+            "email = EXCLUDED.email, "
+            "email_verified = EXCLUDED.email_verified, "
+            "identity_provider = EXCLUDED.identity_provider, "
+            "avatar_url = EXCLUDED.avatar_url, "
+            "updated_at = EXCLUDED.updated_at;"
+        )
+
+    for user in users[:8]:
+        user_id = app_user_ids[user.username]
+        board_user_id = f"board_{user.username.replace('.', '_')}"
+        sql_lines.append(
+            "INSERT INTO user_board_profiles (user_id, board_user_id, display_name, avatar_url, linked_at, last_synced_at, created_at, updated_at) "
+            f"VALUES ({sql_literal(user_id)}, {sql_literal(board_user_id)}, {sql_literal(user.display_name)}, {sql_literal(f'https://cdn.board.fun/avatars/{board_user_id}.png')}, {sql_literal(now)}, {sql_literal(now)}, {sql_literal(now)}, {sql_literal(now)});"
+        )
+
+    organization_ids: dict[str, str] = {}
+    for studio in studios:
+        organization_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/orgs/{studio.slug}"))
+        organization_ids[studio.slug] = organization_id
+        logo_url = f"https://localhost:7277/test-images/generated/{studio.slug.replace('-', '_')}/logo.png"
+        sql_lines.append(
+            "INSERT INTO organizations (id, slug, display_name, description, logo_url, created_at, updated_at) "
+            f"VALUES ({sql_literal(organization_id)}, {sql_literal(studio.slug)}, {sql_literal(studio.display_name)}, {sql_literal(studio.description)}, {sql_literal(logo_url)}, {sql_literal(now)}, {sql_literal(now)});"
+        )
+        sql_lines.append(
+            "INSERT INTO organization_memberships (organization_id, user_id, role, created_at, updated_at) "
+            f"VALUES ({sql_literal(organization_id)}, {sql_literal(app_user_ids[studio.owner_username])}, 'owner', {sql_literal(now)}, {sql_literal(now)});"
+        )
+
+    contributor_memberships = [
+        ("quartz-rabbit-studio", "zoe.martin", "editor"),
+        ("blue-harbor-games", "isaac.romero", "admin"),
+    ]
+    for organization_slug, username, membership_role in contributor_memberships:
+        sql_lines.append(
+            "INSERT INTO organization_memberships (organization_id, user_id, role, created_at, updated_at) "
+            f"VALUES ({sql_literal(organization_ids[organization_slug])}, {sql_literal(app_user_ids[username])}, {sql_literal(membership_role)}, {sql_literal(now)}, {sql_literal(now)});"
+        )
+
+    title_ids: dict[str, str] = {}
+    title_current_metadata_ids: dict[str, str] = {}
+    title_current_release_ids: dict[str, str | None] = {}
+
+    for title in titles:
+        title_slug = str(title["slug"])
+        title_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/titles/{title['organization_slug']}/{title_slug}"))
+        title_ids[title_slug] = title_id
+        sql_lines.append(
+            "INSERT INTO titles (id, organization_id, slug, content_kind, lifecycle_status, visibility, current_metadata_version_id, current_release_id, created_at, updated_at) "
+            f"VALUES ({sql_literal(title_id)}, {sql_literal(organization_ids[str(title['organization_slug'])])}, {sql_literal(title_slug)}, {sql_literal(str(title['content_kind']))}, {sql_literal(str(title['lifecycle_status']))}, {sql_literal(str(title['visibility']))}, NULL, NULL, {sql_literal(now)}, {sql_literal(now)});"
+        )
+
+        revision_count = 2 if int(title["title_index"]) % 3 == 0 else 1
+        metadata_revision_ids: list[str] = []
+        for revision in range(1, revision_count + 1):
+            metadata_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/title-metadata/{title_slug}/{revision}"))
+            metadata_revision_ids.append(metadata_id)
+            short_description = str(title["short_description"]) if revision == revision_count else f"{title['short_description']} Earlier revision."
+            description = str(title["description"]) if revision == revision_count else f"{title['description']} This earlier revision preserves historical copy."
+            is_frozen = revision < revision_count or str(title["lifecycle_status"]) != "draft"
+            sql_lines.append(
+                "INSERT INTO title_metadata_versions (id, title_id, revision_number, display_name, short_description, description, genre_display, min_players, max_players, age_rating_authority, age_rating_value, min_age_years, is_frozen, created_at, updated_at) "
+                f"VALUES ({sql_literal(metadata_id)}, {sql_literal(title_id)}, {revision}, {sql_literal(str(title['display_name']))}, {sql_literal(short_description)}, {sql_literal(description)}, {sql_literal(str(title['genre_display']))}, {int(title['min_players'])}, {int(title['max_players'])}, {sql_literal(str(title['age_rating_authority']))}, {sql_literal(str(title['age_rating_value']))}, {int(title['min_age_years'])}, {sql_literal(is_frozen)}, {sql_literal(now)}, {sql_literal(now)});"
+            )
+
+        current_metadata_id = metadata_revision_ids[-1]
+        title_current_metadata_ids[title_slug] = current_metadata_id
+
+        release_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/title-releases/{title_slug}/current"))
+        lifecycle_status = str(title["lifecycle_status"])
+        release_status = "draft" if lifecycle_status == "draft" else "published"
+        published_at = None if release_status == "draft" else now
+        sql_lines.append(
+            "INSERT INTO title_releases (id, title_id, metadata_version_id, version, status, published_at, created_at, updated_at) "
+            f"VALUES ({sql_literal(release_id)}, {sql_literal(title_id)}, {sql_literal(current_metadata_id)}, {sql_literal('0.1.0' if release_status == 'draft' else '1.0.0')}, {sql_literal(release_status)}, {sql_literal(published_at)}, {sql_literal(now)}, {sql_literal(now)});"
+        )
+
+        if release_status == "published":
+            title_current_release_ids[title_slug] = release_id
+            artifact_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/release-artifacts/{title_slug}/apk"))
+            package_suffix = title_slug.replace("-", "")
+            sql_lines.append(
+                "INSERT INTO release_artifacts (id, release_id, artifact_kind, package_name, version_code, sha256, file_size_bytes, created_at, updated_at) "
+                f"VALUES ({sql_literal(artifact_id)}, {sql_literal(release_id)}, 'apk', {sql_literal(f'fun.board.{package_suffix}')}, {100 + int(title['title_index'])}, {sql_literal(hashlib.sha256(title_slug.encode('utf-8')).hexdigest())}, {sql_literal(96000000 + int(title['title_index']) * 25000)}, {sql_literal(now)}, {sql_literal(now)});"
+            )
+        else:
+            title_current_release_ids[title_slug] = None
+
+    for title in titles:
+        title_slug = str(title["slug"])
+        title_id = title_ids[title_slug]
+        sql_lines.append(
+            "UPDATE titles SET "
+            f"current_metadata_version_id = {sql_literal(title_current_metadata_ids[title_slug])}, "
+            f"current_release_id = {sql_literal(title_current_release_ids[title_slug])}, "
+            f"updated_at = {sql_literal(now)} "
+            f"WHERE id = {sql_literal(title_id)};"
+        )
+
+        assigned_media_roles: set[str] = set(title["media_assignments"])
+        for media_role, (width, height) in {
+            "card": (640, 360),
+            "hero": (1200, 675),
+            "logo": (512, 512),
+        }.items():
+            if media_role not in assigned_media_roles:
+                continue
+            media_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/title-media/{title_slug}/{media_role}"))
+            media_url = f"https://localhost:7277/test-images/generated/{title_slug}/{media_role}.png"
+            sql_lines.append(
+                "INSERT INTO title_media_assets (id, title_id, media_role, source_url, alt_text, mime_type, width, height, created_at, updated_at) "
+                f"VALUES ({sql_literal(media_id)}, {sql_literal(title_id)}, {sql_literal(media_role)}, {sql_literal(media_url)}, {sql_literal(str(title['display_name']) + ' ' + media_role + ' art')}, 'image/png', {width}, {height}, {sql_literal(now)}, {sql_literal(now)});"
+            )
+
+    integration_connection_ids: dict[str, str] = {}
+    supported_publisher_ids = [
+        "44444444-4444-4444-4444-444444444444",
+        "55555555-5555-5555-5555-555555555555",
+        "12121212-1212-1212-1212-121212121212",
+    ]
+    for studio_index, studio in enumerate(studios):
+        connection_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/integration-connections/{studio.slug}"))
+        integration_connection_ids[studio.slug] = connection_id
+        if studio_index % 4 == 3:
+            custom_name = f"{studio.display_name} Direct"
+            custom_url = f"https://{studio.slug}.example.com"
+            sql_lines.append(
+                "INSERT INTO integration_connections (id, organization_id, supported_publisher_id, custom_publisher_display_name, custom_publisher_homepage_url, config_json, is_enabled, created_at, updated_at) "
+                f"VALUES ({sql_literal(connection_id)}, {sql_literal(organization_ids[studio.slug])}, NULL, {sql_literal(custom_name)}, {sql_literal(custom_url)}, {sql_jsonb({'connectionMode': 'direct', 'sandbox': True})}, TRUE, {sql_literal(now)}, {sql_literal(now)});"
+            )
+        else:
+            publisher_id = supported_publisher_ids[studio_index % len(supported_publisher_ids)]
+            sql_lines.append(
+                "INSERT INTO integration_connections (id, organization_id, supported_publisher_id, custom_publisher_display_name, custom_publisher_homepage_url, config_json, is_enabled, created_at, updated_at) "
+                f"VALUES ({sql_literal(connection_id)}, {sql_literal(organization_ids[studio.slug])}, {sql_literal(publisher_id)}, NULL, NULL, {sql_jsonb({'sandbox': True, 'channel': 'local-seed'})}, TRUE, {sql_literal(now)}, {sql_literal(now)});"
+            )
+
+    for title in titles:
+        title_index = int(title["title_index"])
+        if title_index % 5 == 0:
+            continue
+
+        title_slug = str(title["slug"])
+        organization_slug = str(title["organization_slug"])
+        binding_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/title-bindings/{title_slug}"))
+        acquisition_url = f"https://{organization_slug}.example.com/titles/{title_slug}"
+        sql_lines.append(
+            "INSERT INTO title_integration_bindings (id, title_id, integration_connection_id, acquisition_url, acquisition_label, config_json, is_primary, is_enabled, created_at, updated_at) "
+            f"VALUES ({sql_literal(binding_id)}, {sql_literal(title_ids[title_slug])}, {sql_literal(integration_connection_ids[organization_slug])}, {sql_literal(acquisition_url)}, {sql_literal('Open publisher page')}, {sql_jsonb({'seeded': True})}, TRUE, TRUE, {sql_literal(now)}, {sql_literal(now)});"
+        )
+
+    sql_lines.append("COMMIT;")
+    return "\n".join(sql_lines)
+
+
+def sql_literal(value: Any) -> str:
+    """Render a Python value as a SQL literal for seed scripts.
+
+    Args:
+        value: Python value.
+
+    Returns:
+        SQL literal string.
+    """
+
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, datetime):
+        normalized = value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        return f"'{normalized}'::timestamptz"
+
+    escaped = str(value).replace("'", "''")
+    return f"'{escaped}'"
+
+
+def sql_jsonb(value: dict[str, Any] | None) -> str:
+    """Render JSON payload for ``jsonb`` SQL columns.
+
+    Args:
+        value: JSON-serializable dictionary.
+
+    Returns:
+        SQL expression for ``jsonb``.
+    """
+
+    if value is None:
+        return "NULL"
+    return f"{sql_literal(json.dumps(value, separators=(',', ':'), sort_keys=True))}::jsonb"
+
+
+def execute_postgres_sql(config: DevConfig, sql_script: str) -> None:
+    """Execute SQL against local PostgreSQL container.
+
+    Args:
+        config: CLI configuration.
+        sql_script: SQL script text.
+
+    Returns:
+        None.
+
+    Raises:
+        DevCliError: If command execution fails.
+    """
+
+    cmd = [
+        "docker",
+        "exec",
+        "-i",
+        config.postgres_container_name,
+        "psql",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-U",
+        config.postgres_user,
+        "-d",
+        config.postgres_database,
+    ]
+
+    result = subprocess.run(
+        cmd,
+        input=sql_script.encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr_text = (result.stderr or b"").decode(errors="replace").strip()
+        raise DevCliError(
+            f"Seed SQL execution failed ({result.returncode}): {quote_cmd(cmd)}"
+            + (f"\n{stderr_text}" if stderr_text else "")
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the CLI parser with typed subcommands and shared options.
 
@@ -3160,6 +4289,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     restore.add_argument("input", type=Path, help="Path to a .sql backup file created by db-backup")
 
+    seed_data = subparsers.add_parser(
+        "seed-data",
+        parents=[shared],
+        help="Populate deterministic local Keycloak + PostgreSQL sample data for UI/UX testing",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    seed_data.add_argument(
+        "--reset-media",
+        action="store_true",
+        help="Delete and regenerate local generated test images before seeding",
+    )
+    seed_data.add_argument(
+        "--seed-password",
+        default=LOCAL_SEED_DEFAULT_PASSWORD,
+        help="Password assigned to seeded local Keycloak users",
+    )
+
     return parser
 
 
@@ -3319,6 +4465,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             db_backup(config, output_path=args.output)
         elif args.command == "db-restore":
             db_restore(config, input_path=args.input)
+        elif args.command == "seed-data":
+            seed_local_data(
+                config,
+                reset_media=args.reset_media,
+                seed_password=args.seed_password,
+            )
         else:
             parser.error(f"Unknown command: {args.command}")
     except KeyboardInterrupt:

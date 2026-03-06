@@ -39,6 +39,7 @@ The developer CLI orchestrates common local development tasks from the repositor
 - provision/sync Postman mocks and workspace artifacts
 - run environment diagnostics
 - create/restore local PostgreSQL SQL backups
+- seed deterministic local auth/catalog sample data for UI/UX testing
 
 ## Primary Entry Point
 
@@ -112,6 +113,24 @@ Use `web-stop` when a previous `web` session was interrupted and left the backen
 ```bash
 python ./scripts/dev.py up --dependencies-only
 ```
+
+### Seed local sample data for Wave 7 UI/UX testing
+
+```bash
+python ./scripts/dev.py seed-data --reset-media
+```
+
+This command:
+
+- ensures local Keycloak + PostgreSQL dependencies are running
+- provisions/updates deterministic local users in Keycloak (including role assignments)
+- regenerates catalog test images under `frontend/src/Board.ThirdPartyLibrary.Frontend.Web/wwwroot/test-images/generated`
+- repopulates local PostgreSQL organization/title/media/release/integration data used by current player/developer/moderation workflows
+
+Useful flags:
+
+- `--reset-media`
+- `--seed-password`
 
 ### Run the frontend web UI
 
@@ -297,6 +316,7 @@ API workflow commands also expose workflow-specific overrides. Common examples:
 - `web-status`
 - `web-stop --down-dependencies`
 - `frontend --hot-reload`
+- `seed-data --seed-password <value>`
 
 For live API contract execution, the default environment template is:
 

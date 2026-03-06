@@ -84,11 +84,29 @@ Status: in progress
 ### Chunk 3: Moderation API Client Wiring
 
 - wire frontend API client methods for:
+  - `GET /moderation/developers`
+  - `GET /moderation/developers/{developerIdentifier}/verification`
   - `PUT /moderation/developers/{developerSubject}/verified-developer`
   - `DELETE /moderation/developers/{developerSubject}/verified-developer`
-- keep backend contract and behavior aligned with Wave 6 moderation endpoints
+- power a moderation workflow UX that:
+  - shows `Verify Developers` in the workflow menu
+  - supports fuzzy search by username/display name/email
+  - uses a single verified toggle instead of separate grant/remove buttons
+  - avoids exposing raw role codes in user-facing copy
 - test gate:
   - frontend test stub coverage updated for new API client methods
+
+### Chunk 4: Local Wave Data Seeding
+
+- add `python ./scripts/dev.py seed-data` for deterministic local test-data generation
+- seed representative auth + catalog data for current workflow validation:
+  - 20 platform users across super-admin/admin/moderator/developer/player access mixes
+  - multi-studio developer ownership and contributor edge cases
+  - studio/title/media/release/integration/binding data with realistic copy variation and missing-media states
+- generate title card/hero/logo image fixtures under the same local frontend test-image root used by existing mock assets
+- test gate:
+  - seed command can be rerun idempotently
+  - backend/frontend route and integration tests remain green after reseed
 
 ## Wave 8: Unified Commerce And Entitlements
 
