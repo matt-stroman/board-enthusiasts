@@ -17,7 +17,7 @@ It exists to make one distinction explicit:
 
 - the repository already implements a usable API/authentication foundation
 - Wave 1 application-owned identity persistence is implemented
-- Wave 2 organizations and memberships are implemented
+- Wave 2 studios and memberships are implemented
 - Wave 3 titles and versioned metadata are implemented
 - Wave 4 media, releases, and APK artifact metadata are implemented
 - Wave 5 supported publishers and external acquisition bindings are implemented
@@ -44,9 +44,9 @@ As of March 5, 2026, the maintained implemented surface is:
 - health endpoints: `/`, `/health/live`, `/health/ready`
 - Keycloak-backed identity endpoints: `/identity/roles`, `/identity/auth/config`, `/identity/auth/login`, `/identity/auth/callback`, `/identity/me`, `GET|POST /identity/me/developer-enrollment`, and `GET|PUT|DELETE /identity/me/board-profile`
 - moderation endpoints: `GET /moderation/developers`, `GET /moderation/developers/{developerIdentifier}/verification`, and `PUT|DELETE /moderation/developers/{developerSubject}/verified-developer`
-- organization endpoints: public `GET /organizations`, public `GET /organizations/{slug}`, authenticated `POST|PUT|DELETE /organizations...`, and authenticated membership management endpoints
-- catalog endpoints: public `GET /catalog`, public `GET /catalog/{organizationSlug}/{titleSlug}`, authenticated title/metadata management endpoints, authenticated media/release/artifact management endpoints, public `GET /supported-publishers`, and authenticated connection/acquisition-binding management endpoints
-- EF Core persistence with migrations for `users`, `user_board_profiles`, `organizations`, `organization_memberships`, `titles`, `title_metadata_versions`, `title_media_assets`, `title_releases`, `release_artifacts`, `supported_publishers`, `integration_connections`, and `title_integration_bindings`
+- studio endpoints: public `GET /studios`, public `GET /studios/{slug}`, authenticated `POST|PUT|DELETE /studios...`, and authenticated membership management endpoints
+- catalog endpoints: public `GET /catalog`, public `GET /catalog/{studioSlug}/{titleSlug}`, authenticated title/metadata management endpoints, authenticated media/release/artifact management endpoints, public `GET /supported-publishers`, and authenticated connection/acquisition-binding management endpoints
+- EF Core persistence with migrations for `users`, `user_board_profiles`, `studios`, `studio_memberships`, `titles`, `title_metadata_versions`, `title_media_assets`, `title_releases`, `release_artifacts`, `supported_publishers`, `integration_connections`, and `title_integration_bindings`
 - Postman mock-first contract assets for the above endpoints
 - backend endpoint unit tests plus Postgres-backed integration coverage for persistence and constraints
 - developer automation for local bootstrap, Docker dependencies, and test execution
@@ -84,7 +84,7 @@ Application identity projection and optional Board profile persistence:
 
 ### Wave 2 (implemented)
 
-Organizations and memberships.
+Studios and memberships.
 
 ### Wave 3 (implemented)
 
@@ -153,3 +153,5 @@ For every new externally visible capability:
 4. Implement production code and migrations.
 5. Run automated backend and contract test suites.
 6. Update the maintained docs and agent guidance in the same change set.
+
+

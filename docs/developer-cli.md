@@ -125,7 +125,7 @@ This command:
 - ensures local Keycloak + PostgreSQL dependencies are running
 - provisions/updates deterministic local users in Keycloak (including role assignments)
 - regenerates catalog test images under `frontend/src/Board.ThirdPartyLibrary.Frontend.Web/wwwroot/test-images/generated`
-- repopulates local PostgreSQL organization/title/media/release/integration data used by current player/developer/moderation workflows
+- repopulates local PostgreSQL studio/title/media/release/integration data used by current player/developer/moderation workflows
 
 Useful flags:
 
@@ -219,7 +219,7 @@ python ./scripts/dev.py api-test
 
 Important for live local runs:
 
-- the committed local environment file contains placeholder values for authenticated and persistence-backed success paths such as `accessToken`, `organizationId`, `organizationSlug`, `titleId`, and `titleSlug`
+- the committed local environment file contains placeholder values for authenticated and persistence-backed success paths such as `accessToken`, `studioId`, `studioSlug`, `titleId`, and `titleSlug`
 - the collection skips those success-path assertions until you replace the placeholders with real local values
 - health and unauthenticated/public catalog coverage still runs with the committed template as-is
 
@@ -331,3 +331,5 @@ Populate the placeholder auth and resource IDs in a private copy when you want f
 - VS Code tasks in this repo call the Python CLI directly.
 - The supported developer entry point for this repository is `python ./scripts/dev.py ...`; API-local helper scripts under `api/scripts/` are implementation details for CI and the root CLI.
 - Tool executables are resolved from each developer's `PATH`; the CLI does not assume fixed install directories for `dotnet`, `node`, `npx`, `postman`, `docker`, or other required tools.
+
+
