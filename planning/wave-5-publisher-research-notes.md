@@ -79,7 +79,7 @@ Design implication:
 Wave 5 should prefer these capabilities:
 
 - a platform-managed `supported_publishers` registry for standardized publisher identity and display metadata
-- organization-level reusable external publisher/store connection records
+- studio-level reusable external publisher/store connection records
 - optional connection linkage to a supported publisher registry row
 - custom publisher details on the connection itself when no supported publisher fits
 - title-level acquisition binding records
@@ -105,3 +105,4 @@ Recommended upcoming delivery order:
 3. Wave 7: Board-native delivery and install
 
 This sequence keeps the first next wave shippable while preserving room for richer integrations where official platform capabilities actually exist.
+

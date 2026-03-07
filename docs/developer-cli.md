@@ -39,6 +39,7 @@ The developer CLI orchestrates common local development tasks from the repositor
 - provision/sync Postman mocks and workspace artifacts
 - run environment diagnostics
 - create/restore local PostgreSQL SQL backups
+- seed deterministic local auth/catalog sample data for UI/UX testing
 
 ## Primary Entry Point
 
@@ -58,6 +59,8 @@ python ./scripts/dev.py web --hot-reload
 ```
 
 This starts Docker dependencies, the backend API, the frontend web app with Razor hot reload, and then opens the frontend URL in your default browser. On Windows, if Docker Desktop is installed but not already running, the CLI will try to launch it automatically and wait for the daemon before continuing. The root workflow is HTTPS-first for frontend, backend, Keycloak, and the local Mailpit UI, and it also exports TLS material for the local PostgreSQL container and Mailpit SMTP STARTTLS. It will launch the frontend at `https://localhost:7277`, the backend at `https://localhost:7085`, Keycloak at `https://localhost:8443`, and Mailpit at `https://localhost:8025`, while local PostgreSQL rejects non-TLS TCP connections.
+
+The frontend reconnect modal now retries automatically when the browser tab becomes visible again, when the window regains focus, when the page is restored, and when the client comes back online. If the Blazor circuit cannot be resumed, the page reloads instead of leaving the UI in a dead-click state.
 
 Local registration and verification emails are captured in Mailpit:
 
@@ -112,6 +115,28 @@ Use `web-stop` when a previous `web` session was interrupted and left the backen
 ```bash
 python ./scripts/dev.py up --dependencies-only
 ```
+
+### Seed local sample data for Wave 7 UI/UX testing
+
+```bash
+python ./scripts/dev.py seed-data --reset-media
+```
+
+This command:
+
+- ensures local Keycloak + PostgreSQL dependencies are running
+- provisions/updates deterministic local users in Keycloak (including role assignments)
+- validates the checked-in title and studio media bundles under `frontend/src/Board.ThirdPartyLibrary.Frontend.Web/wwwroot/test-images/seed-catalog`
+- repopulates local PostgreSQL studio/title/media/release/integration data used by current player/developer/moderation workflows
+- seeds public studio banners plus studio support/social links alongside the studio records
+
+The seed data references those static local asset URLs directly, so rerunning the command refreshes the database state without regenerating art at runtime.
+Title card/hero/logo media should be checked-in PNGs, while studio logos remain SVGs. Studio banners use checked-in PNGs when available and otherwise fall back to the checked-in SVG variants.
+
+Useful flags:
+
+- `--reset-media` clears the obsolete legacy generated-media cache before validation
+- `--seed-password`
 
 ### Run the frontend web UI
 
@@ -200,7 +225,8 @@ python ./scripts/dev.py api-test
 
 Important for live local runs:
 
-- the committed local environment file contains placeholder values for authenticated and persistence-backed success paths such as `accessToken`, `organizationId`, `organizationSlug`, `titleId`, and `titleSlug`
+- the committed local environment file contains placeholder values for authenticated and persistence-backed success paths such as `accessToken`, `studioId`, `studioSlug`, `titleId`, and `titleSlug`
+- the committed local environment file also leaves `studioLinkId` as a placeholder for studio-link update/delete flows
 - the collection skips those success-path assertions until you replace the placeholders with real local values
 - health and unauthenticated/public catalog coverage still runs with the committed template as-is
 
@@ -297,6 +323,7 @@ API workflow commands also expose workflow-specific overrides. Common examples:
 - `web-status`
 - `web-stop --down-dependencies`
 - `frontend --hot-reload`
+- `seed-data --seed-password <value>`
 
 For live API contract execution, the default environment template is:
 
@@ -311,3 +338,5 @@ Populate the placeholder auth and resource IDs in a private copy when you want f
 - VS Code tasks in this repo call the Python CLI directly.
 - The supported developer entry point for this repository is `python ./scripts/dev.py ...`; API-local helper scripts under `api/scripts/` are implementation details for CI and the root CLI.
 - Tool executables are resolved from each developer's `PATH`; the CLI does not assume fixed install directories for `dotnet`, `node`, `npx`, `postman`, `docker`, or other required tools.
+
+

@@ -55,7 +55,7 @@ Status: in progress
 
 ## Wave 7: Developer And Moderation Workflow Console
 
-Status: in progress
+Status: completed on March 7, 2026
 
 ### Chunk 1: Develop Workspace Shell
 
@@ -65,6 +65,10 @@ Status: in progress
   - top domain tabs (`Studios`, `Titles`, `Releases`, `Publishing`)
   - left contextual workflow menu
   - in-place workflow content switching without route changes for primary browse/manage tasks
+- deliver first in-place Studios workflow set:
+  - studio overview cards
+  - create studio form
+  - studio settings edit form for the active studio context
 - test gate:
   - frontend route smoke tests cover player onboarding and developer shell markers
 
@@ -80,22 +84,81 @@ Status: in progress
 ### Chunk 3: Moderation API Client Wiring
 
 - wire frontend API client methods for:
+  - `GET /moderation/developers`
+  - `GET /moderation/developers/{developerIdentifier}/verification`
   - `PUT /moderation/developers/{developerSubject}/verified-developer`
   - `DELETE /moderation/developers/{developerSubject}/verified-developer`
-- keep backend contract and behavior aligned with Wave 6 moderation endpoints
+- power a moderation workflow UX that:
+  - shows `Verify Developers` in the workflow menu
+  - supports fuzzy search by username/display name/email
+  - uses a single verified toggle instead of separate grant/remove buttons
+  - avoids exposing raw role codes in user-facing copy
 - test gate:
   - frontend test stub coverage updated for new API client methods
+
+### Chunk 4: Local Wave Data Seeding
+
+- add `python ./scripts/dev.py seed-data` for deterministic local test-data generation
+- seed representative auth + catalog data for current workflow validation:
+  - 20 platform users across super-admin/admin/moderator/developer/player access mixes
+  - multi-studio developer ownership and contributor edge cases
+  - studio/title/media/release/integration/binding data with realistic copy variation and missing-media states
+- generate title card/hero/logo image fixtures under the same local frontend test-image root used by existing mock assets
+- test gate:
+  - seed command can be rerun idempotently
+  - backend/frontend route and integration tests remain green after reseed
+
+### Chunk 5: Studio Branding, Public Links, And Catalog UX Alignment
+
+- extend studio management and public studio pages with:
+  - studio logo upload/URL support
+  - studio banner upload/URL support
+  - public studio links for social/support/promotional destinations
+  - icon rendering for known social hosts plus fallback text links for other hosts
+- align the per-studio public catalog page with the shared `/browse` search/filter UX:
+  - live client-side filtering
+  - no apply button or route reload for filter changes
+  - compact paged card-grid results
+  - results-per-page control
+  - in-page quick-view modal for title details
+- remove obsolete standalone `/develop/studios/...` pages that are superseded by the in-place `/develop` studio workflows
+- test gate:
+  - OpenAPI and Postman contract assets include the studio link and media-upload surfaces
+  - backend endpoint and integration tests cover studio links and studio media persistence
+  - frontend route smoke/tests reflect the shared browse/studio UX and removed obsolete routes
 
 ## Wave 8: Unified Commerce And Entitlements
 
 Status: planned
 
+### Chunk 1: Player Library And Wishlist Foundation
+
+- reintroduce player-owned library projections backed by entitlement-ready schema
+- implement authenticated player wishlist CRUD surface and persistence
+- add player-facing browse/title interactions for library and wishlist actions:
+  - wishlist toggle affordance on title cards/details (heart icon)
+  - ownership action to place a title into the player library projection
+- restore player-library and wishlist contract coverage that was removed from active-wave delivery
+- test gate:
+  - contract tests for player library and wishlist endpoints
+  - backend integration tests for wishlist persistence and player scoping
+
+### Chunk 2: Commerce Abstractions And Purchase Flow
+
 - purchase orchestration abstractions across external providers
-- durable entitlement model that drives ownership in player library surfaces
-- event/audit trail for purchase and entitlement transitions
+- provider capability mapping and normalized purchase-attempt lifecycle
 - test gate:
   - provider-agnostic contract tests
+  - unit tests for purchase-state transitions
+
+### Chunk 3: Entitlements And Ownership Read Models
+
+- durable entitlement model that drives ownership in player library surfaces
+- player-owned read models for owned titles, acquisition source metadata, and fulfillment state
+- event/audit trail for purchase and entitlement transitions
+- test gate:
   - entitlement consistency integration tests
+  - projection/read-model regression tests for library ownership views
 
 ## Wave 9: Board Install And Delivery
 

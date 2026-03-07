@@ -14,6 +14,7 @@ This script is the primary developer automation entry point for:
   with optional backend auto-start for local contract runs
 - environment diagnostics (`doctor`)
 - local PostgreSQL backup/restore helpers (`db-backup`, `db-restore`)
+- deterministic local auth/catalog sample data seeding (`seed-data`)
 
 Use `python ./scripts/dev.py --help` and `python ./scripts/dev.py <command> --help`
 for command-specific help.
@@ -22,24 +23,30 @@ for command-specific help.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import json
+import math
 import os
 import shlex
 import shutil
 import signal
+import socket
 import ssl
+import struct
 import subprocess
 import sys
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 
 @dataclass(frozen=True)
@@ -262,6 +269,8 @@ def run_command(
         check=False,
         capture_output=capture_output,
         text=text,
+        encoding="utf-8" if text else None,
+        errors="replace" if text else None,
         stdin=stdin,
         stdout=stdout,
         stderr=stderr,
@@ -516,6 +525,187 @@ def wait_for_http_ready(*, url: str, description: str, timeout_seconds: int = 90
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         reachable, detail = probe_http_url(url)
+        if reachable:
+            print(f"{description} is ready.")
+            return
+        time.sleep(2)
+
+    raise DevCliError(f"Timed out waiting for {description} readiness at {url}.")
+
+
+def get_url_host_port(url: str) -> tuple[str, int]:
+    """Resolve the host and port for a URL.
+
+    Args:
+        url: URL to inspect.
+
+    Returns:
+        Tuple of ``(host, port)``.
+
+    Raises:
+        DevCliError: If the URL omits a host or uses an unsupported scheme.
+    """
+
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").strip()
+    if not host:
+        raise DevCliError(f"URL does not include a host: {url}")
+
+    if parsed.port is not None:
+        return host, parsed.port
+
+    scheme = parsed.scheme.lower()
+    if scheme == "https":
+        return host, 443
+    if scheme == "http":
+        return host, 80
+
+    raise DevCliError(f"Unsupported URL scheme '{parsed.scheme}' for local port inspection: {url}")
+
+
+def can_connect_to_tcp_port(*, host: str, port: int, timeout_seconds: float = 0.5) -> bool:
+    """Return whether a TCP listener accepts connections at the host and port.
+
+    Args:
+        host: Host name or IP address to probe.
+        port: TCP port to probe.
+        timeout_seconds: Socket connect timeout.
+
+    Returns:
+        ``True`` when a listener accepts the connection, else ``False``.
+    """
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout_seconds):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_local_url_port_available(*, url: str, description: str) -> None:
+    """Ensure a local URL target port is not already occupied.
+
+    Args:
+        url: Local URL to inspect.
+        description: Human-readable service description used in the failure message.
+
+    Returns:
+        None.
+
+    Raises:
+        DevCliError: If another local process is already listening on the URL port.
+    """
+
+    if not is_local_http_url(url):
+        return
+
+    host, port = get_url_host_port(url)
+    if not can_connect_to_tcp_port(host=host, port=port):
+        return
+
+    raise DevCliError(
+        f"Cannot start {description}: {url} is already in use by another local process. "
+        f"Stop the existing process bound to port {port}, or reuse that existing instance instead."
+    )
+
+
+def wait_for_background_process_http_ready(
+    *,
+    process: subprocess.Popen,
+    url: str,
+    description: str,
+    log_path: Path | None = None,
+    timeout_seconds: int = 90,
+) -> None:
+    """Wait until a spawned background process serves HTTP successfully.
+
+    Args:
+        process: Spawned background process expected to serve the URL.
+        url: URL to poll for readiness.
+        description: Human-readable service description for log output.
+        log_path: Optional log file written by the background process.
+        timeout_seconds: Maximum time to wait before failing.
+
+    Returns:
+        None.
+
+    Raises:
+        DevCliError: If the process exits before the URL becomes ready or the URL
+            never becomes ready before timeout.
+    """
+
+    write_step(f"Waiting for {description} readiness (up to {timeout_seconds} seconds)")
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if process.poll() is not None:
+            exit_code = process.returncode if process.returncode is not None else "unknown"
+            log_excerpt = ""
+            if log_path is not None and log_path.exists():
+                log_excerpt = log_path.read_text(encoding="utf-8", errors="replace").strip()
+                if len(log_excerpt) > 4000:
+                    log_excerpt = log_excerpt[-4000:]
+
+            message = (
+                f"{description} exited before becoming ready (exit code {exit_code}). "
+                f"Review log: {log_path or 'n/a'}"
+            )
+            if log_excerpt:
+                message = f"{message}\nRecent log output:\n{log_excerpt}"
+            raise DevCliError(message)
+
+        reachable, _detail = probe_http_url(url)
+        if reachable:
+            print(f"{description} is ready.")
+            return
+        time.sleep(2)
+
+    raise DevCliError(f"Timed out waiting for {description} readiness at {url}.")
+
+
+def wait_for_container_http_ready(
+    *,
+    url: str,
+    description: str,
+    container_name: str,
+    timeout_seconds: int = 90,
+) -> None:
+    """Wait until an HTTP endpoint is ready while also validating container health.
+
+    Args:
+        url: URL to poll for readiness.
+        description: Human-readable service description for log output.
+        container_name: Docker container name backing the service.
+        timeout_seconds: Maximum time to wait before failing.
+
+    Returns:
+        None.
+
+    Raises:
+        DevCliError: If the service container crash-loops, exits, disappears, or the
+            endpoint does not return success before timeout.
+    """
+
+    write_step(f"Waiting for {description} readiness (up to {timeout_seconds} seconds)")
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        container_state = get_docker_container_state(container_name)
+        if container_state in {"restarting", "exited", "dead"}:
+            logs_result = run_command(
+                ["docker", "logs", "--tail", "80", container_name],
+                check=False,
+                capture_output=True,
+            )
+            logs = (logs_result.stdout or logs_result.stderr or "").strip()
+            detail = f"Container '{container_name}' is in state '{container_state}'."
+            if logs:
+                detail = f"{detail}\nRecent logs:\n{logs}"
+
+            raise DevCliError(detail)
+
+        if container_state is None:
+            raise DevCliError(f"Container '{container_name}' was not found while waiting for {description} readiness.")
+
+        reachable, _detail = probe_http_url(url)
         if reachable:
             print(f"{description} is ready.")
             return
@@ -894,6 +1084,7 @@ def start_backend_api_process(config: DevConfig) -> tuple[subprocess.Popen, Path
     project_path = config.repo_root / config.backend_project
     if not project_path.exists():
         raise DevCliError(f"Backend project not found: {project_path}")
+    ensure_local_url_port_available(url=config.backend_base_url, description="backend API")
 
     logs_dir = config.repo_root / ".dev-cli-logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -1095,6 +1286,37 @@ def start_background_command(
     return process
 
 
+DOTNET_WATCH_ENC_CRASH_MARKERS = (
+    "An unexpected error occurred: System.InvalidOperationException: Unexpected value 'Block'",
+    "Microsoft.CodeAnalysis.CSharp.LambdaUtilities.TryGetCorrespondingLambdaBody",
+)
+
+
+def is_known_dotnet_watch_enc_crash(*, return_code: int, log_path: Path | None = None) -> bool:
+    """Return whether a ``dotnet watch`` exit matches the known Roslyn EnC crash signature.
+
+    Args:
+        return_code: Process exit code from ``dotnet watch``.
+        log_path: Optional log file path to inspect for crash markers.
+
+    Returns:
+        ``True`` when the exit/signature matches the known crash pattern.
+    """
+
+    if return_code != -1:
+        return False
+
+    if log_path is None or not log_path.exists():
+        return True
+
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return True
+
+    return any(marker in text for marker in DOTNET_WATCH_ENC_CRASH_MARKERS)
+
+
 def ensure_api_base_url_reachable(base_url: str) -> None:
     """Ensure the target API base URL is reachable before contract execution.
 
@@ -1248,9 +1470,10 @@ def start_dependencies(config: DevConfig, *, include_keycloak: bool = True) -> N
             write_step("Starting Keycloak via docker compose")
             invoke_docker_compose(config, ["up", "-d", "keycloak"])
 
-        wait_for_http_ready(
+        wait_for_container_http_ready(
             url=config.keycloak_ready_url,
             description="Keycloak",
+            container_name=config.keycloak_container_name,
             timeout_seconds=KEYCLOAK_READY_TIMEOUT_SECONDS,
         )
 
@@ -1387,6 +1610,7 @@ def run_backend_api(config: DevConfig, *, do_restore: bool) -> None:
     project_path = config.repo_root / config.backend_project
     if not project_path.exists():
         raise DevCliError(f"Backend project not found: {project_path}")
+    ensure_local_url_port_available(url=config.backend_base_url, description="backend API")
 
     if do_restore:
         write_step("Restoring backend project")
@@ -1491,13 +1715,29 @@ def run_frontend_web_ui(
             )
             print(f"Tailwind watch log: {css_watch_log_path}")
 
-        write_step(f"Starting frontend web UI with hot reload at {config.frontend_base_url} (Ctrl+C to stop)")
-        run_command(
-            get_frontend_web_launch_command(project_path),
-            cwd=frontend_root,
-            check=True,
-            env=build_frontend_web_environment(frontend_url=config.frontend_base_url),
-        )
+        launch_mode = "with hot reload" if hot_reload else "without hot reload"
+        write_step(f"Starting frontend web UI {launch_mode} at {config.frontend_base_url} (Ctrl+C to stop)")
+        while True:
+            result = run_command(
+                get_frontend_web_launch_command(project_path, hot_reload=hot_reload),
+                cwd=frontend_root,
+                check=False,
+                env=build_frontend_web_environment(frontend_url=config.frontend_base_url, hot_reload=hot_reload),
+            )
+            if result.returncode == 0:
+                break
+
+            if hot_reload and is_known_dotnet_watch_enc_crash(return_code=result.returncode):
+                print(
+                    "dotnet watch exited due a known Roslyn hot-reload compiler crash. "
+                    "Restarting watch automatically in 2 seconds..."
+                )
+                time.sleep(2)
+                continue
+
+            raise DevCliError(
+                f"Frontend web UI exited unexpectedly (exit code {result.returncode})."
+            )
     finally:
         if css_watch_process is not None:
             write_step("Stopping frontend Tailwind watch")
@@ -1579,6 +1819,9 @@ def run_full_local_web_stack(
     css_watch_log_path: Path | None = None
 
     try:
+        ensure_local_url_port_available(url=backend_url, description="backend API")
+        ensure_local_url_port_available(url=frontend_url, description="frontend web UI")
+
         write_step("Starting backend API in the background")
         backend_process, backend_log_path = start_background_command_with_log(
             cmd=["dotnet", "run", "--project", str(config.repo_root / config.backend_project), "--no-restore", "--no-launch-profile"],
@@ -1593,7 +1836,12 @@ def run_full_local_web_stack(
             config=config,
         )
         print(f"Backend log: {backend_log_path}")
-        wait_for_http_ready(url=f"{backend_url.rstrip('/')}/health/live", description="Backend API")
+        wait_for_background_process_http_ready(
+            process=backend_process,
+            url=f"{backend_url.rstrip('/')}/health/live",
+            description="Backend API",
+            log_path=backend_log_path,
+        )
 
         keycloak_ready, keycloak_detail = probe_http_url(config.keycloak_ready_url)
         if not keycloak_ready:
@@ -1611,13 +1859,20 @@ def run_full_local_web_stack(
             )
             print(f"Tailwind watch log: {css_watch_log_path}")
 
-        write_step("Starting frontend web UI with hot reload in the background")
+        launch_mode = "with hot reload" if hot_reload else "without hot reload"
+        write_step(f"Starting frontend web UI {launch_mode} in the background")
         frontend_process, frontend_log_path = start_frontend_web_process_with_log(
             config,
             frontend_url=frontend_url,
+            hot_reload=hot_reload,
         )
         print(f"Frontend log: {frontend_log_path}")
-        wait_for_http_ready(url=frontend_url, description="Frontend web UI")
+        wait_for_background_process_http_ready(
+            process=frontend_process,
+            url=frontend_url,
+            description="Frontend web UI",
+            log_path=frontend_log_path,
+        )
 
         state: dict[str, object] = {
             "started_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -1655,8 +1910,38 @@ def run_full_local_web_stack(
                 )
 
             if frontend_process.poll() is not None:
+                frontend_return_code = frontend_process.returncode or 0
+                if hot_reload and is_known_dotnet_watch_enc_crash(
+                    return_code=frontend_return_code,
+                    log_path=frontend_log_path,
+                ):
+                    write_step(
+                        "Frontend dotnet watch hit a known Roslyn hot-reload compiler crash; restarting automatically"
+                    )
+                    frontend_process, frontend_log_path = start_frontend_web_process_with_log(
+                        config,
+                        frontend_url=frontend_url,
+                        hot_reload=hot_reload,
+                    )
+                    print(f"Frontend log: {frontend_log_path}")
+                    wait_for_background_process_http_ready(
+                        process=frontend_process,
+                        url=frontend_url,
+                        description="Frontend web UI",
+                        log_path=frontend_log_path,
+                    )
+
+                    state["frontend"] = {
+                        "pid": frontend_process.pid,
+                        "url": frontend_url,
+                        "log_path": str(frontend_log_path),
+                    }
+                    save_web_stack_state(config, state=state)
+                    continue
+
                 raise DevCliError(
-                    f"Frontend web UI exited unexpectedly. Review log: {frontend_log_path}"
+                    f"Frontend web UI exited unexpectedly (exit code {frontend_return_code}). "
+                    f"Review log: {frontend_log_path}"
                 )
     except KeyboardInterrupt:
         print("\nStopping local web stack.")
@@ -1796,48 +2081,56 @@ def start_background_command_with_log(
     return process, log_path
 
 
-def get_frontend_web_launch_command(project_path: Path) -> list[str]:
-    """Return the frontend web launch command with Razor hot reload enabled.
+def get_frontend_web_launch_command(project_path: Path, *, hot_reload: bool) -> list[str]:
+    """Return the frontend web launch command.
 
     Args:
         project_path: Frontend web project path.
+        hot_reload: Whether to launch with ``dotnet watch``.
 
     Returns:
-        Command tokens for launching the frontend with ``dotnet watch run``.
+        Command tokens for launching the frontend web app.
     """
 
-    return ["dotnet", "watch", "--project", str(project_path), "run", "--no-restore", "--no-launch-profile"]
+    if hot_reload:
+        return ["dotnet", "watch", "--project", str(project_path), "run", "--no-restore", "--no-launch-profile"]
+
+    return ["dotnet", "run", "--project", str(project_path), "--no-restore", "--no-launch-profile"]
 
 
-def build_frontend_web_environment(*, frontend_url: str) -> dict[str, str]:
-    """Build the environment used by frontend web runs with hot reload.
+def build_frontend_web_environment(*, frontend_url: str, hot_reload: bool) -> dict[str, str]:
+    """Build the environment used by frontend web runs.
 
     Args:
         frontend_url: URL the frontend should bind to.
+        hot_reload: Whether frontend hot reload is enabled.
 
     Returns:
         Environment variables for the frontend process.
     """
 
-    return build_subprocess_env(
-        extra={
-            "ASPNETCORE_URLS": frontend_url,
-            "ASPNETCORE_ENVIRONMENT": "Development",
-            "DOTNET_WATCH_RESTART_ON_RUDE_EDIT": "true",
-        }
-    )
+    extra = {
+        "ASPNETCORE_URLS": frontend_url,
+        "ASPNETCORE_ENVIRONMENT": "Development",
+    }
+    if hot_reload:
+        extra["DOTNET_WATCH_RESTART_ON_RUDE_EDIT"] = "true"
+
+    return build_subprocess_env(extra=extra)
 
 
 def start_frontend_web_process_with_log(
     config: DevConfig,
     *,
     frontend_url: str,
+    hot_reload: bool,
 ) -> tuple[subprocess.Popen, Path]:
     """Start the frontend web app and return both process and log path.
 
     Args:
         config: CLI configuration containing frontend paths.
         frontend_url: URL the frontend should bind to.
+        hot_reload: Whether frontend hot reload is enabled.
 
     Returns:
         Tuple of process handle and log file path.
@@ -1848,13 +2141,14 @@ def start_frontend_web_process_with_log(
     project_path = config.repo_root / config.frontend_web_project
     if not project_path.exists():
         raise DevCliError(f"Frontend web project not found: {project_path}")
+    ensure_local_url_port_available(url=frontend_url, description="frontend web UI")
 
     return start_background_command_with_log(
-        cmd=get_frontend_web_launch_command(project_path),
+        cmd=get_frontend_web_launch_command(project_path, hot_reload=hot_reload),
         cwd=frontend_root,
         log_name="frontend-web.log",
         config=config,
-        env=build_frontend_web_environment(frontend_url=frontend_url),
+        env=build_frontend_web_environment(frontend_url=frontend_url, hot_reload=hot_reload),
     )
 
 
@@ -2144,7 +2438,13 @@ def run_api_contract_tests(
         write_step("Starting backend API in the background for contract tests")
         backend_process, backend_log_path = start_backend_api_process(config)
         try:
-            wait_for_http_ready(url=base_url, description="backend API", timeout_seconds=60)
+            wait_for_background_process_http_ready(
+                process=backend_process,
+                url=base_url,
+                description="backend API",
+                log_path=backend_log_path,
+                timeout_seconds=60,
+            )
         except DevCliError as ex:
             stop_background_process(backend_process)
             log_excerpt = ""
@@ -2624,6 +2924,1334 @@ def db_restore(config: DevConfig, *, input_path: Path) -> None:
     print("Restore complete.")
 
 
+LOCAL_KEYCLOAK_ADMIN_USERNAME = "admin"
+LOCAL_KEYCLOAK_ADMIN_PASSWORD = "admin"
+LOCAL_KEYCLOAK_DEFAULT_REALM = "board-third-party-library"
+LOCAL_SEED_DEFAULT_PASSWORD = "ChangeMe!123"
+LOCAL_SEED_IMAGE_BASE_PATH = Path("frontend/src/Board.ThirdPartyLibrary.Frontend.Web/wwwroot/test-images/seed-catalog")
+LEGACY_LOCAL_SEED_GENERATED_IMAGE_PATH = Path("frontend/src/Board.ThirdPartyLibrary.Frontend.Web/wwwroot/test-images/generated")
+
+
+@dataclass(frozen=True)
+class LocalSeedUser:
+    """Represents a deterministic local auth + profile seed user."""
+
+    username: str
+    first_name: str
+    last_name: str
+    roles: tuple[str, ...]
+
+    @property
+    def display_name(self) -> str:
+        return f"{self.first_name} {self.last_name}"
+
+    @property
+    def email(self) -> str:
+        return f"{self.username}@boardtpl.local"
+
+
+@dataclass(frozen=True)
+class LocalSeedStudio:
+    """Represents a deterministic studio used for local UX seed data."""
+
+    slug: str
+    display_name: str
+    description: str
+    owner_username: str
+    links: tuple[tuple[str, str], ...]
+
+
+def seed_local_data(config: DevConfig, *, reset_media: bool, seed_password: str) -> None:
+    """Populate local Keycloak and PostgreSQL with deterministic Wave 7 sample data.
+
+    Args:
+        config: CLI configuration for local containers and paths.
+        reset_media: Whether to clear the obsolete generated-media cache after validating static assets.
+        seed_password: Password assigned to seeded local Keycloak users.
+
+    Returns:
+        None.
+
+    Raises:
+        DevCliError: If dependencies are unavailable or seed operations fail.
+    """
+
+    assert_command_available("docker")
+    ensure_postgres_running_for_db_ops(config)
+    ensure_keycloak_running_for_seed(config)
+
+    keycloak_base_url, keycloak_realm = resolve_keycloak_seed_context(config)
+    write_step(f"Preparing local auth seed in Keycloak realm '{keycloak_realm}'")
+    admin_access_token = get_keycloak_admin_access_token(
+        keycloak_base_url=keycloak_base_url,
+        admin_username=LOCAL_KEYCLOAK_ADMIN_USERNAME,
+        admin_password=LOCAL_KEYCLOAK_ADMIN_PASSWORD,
+    )
+
+    users = build_local_seed_users()
+    managed_role_names = sorted(
+        {
+            "player",
+            "developer",
+            "verified_developer",
+            "super_admin",
+            "admin",
+            "moderator",
+            *(role for user in users for role in user.roles),
+        },
+        key=str.casefold,
+    )
+    ensure_keycloak_realm_roles(
+        keycloak_base_url=keycloak_base_url,
+        keycloak_realm=keycloak_realm,
+        admin_access_token=admin_access_token,
+        role_names=managed_role_names,
+    )
+    role_representations = {
+        role_name: get_keycloak_realm_role(
+            keycloak_base_url=keycloak_base_url,
+            keycloak_realm=keycloak_realm,
+            admin_access_token=admin_access_token,
+            role_name=role_name,
+        )
+        for role_name in managed_role_names
+    }
+
+    seeded_user_subjects: dict[str, str] = {}
+    for user in users:
+        user_subject = upsert_keycloak_user(
+            keycloak_base_url=keycloak_base_url,
+            keycloak_realm=keycloak_realm,
+            admin_access_token=admin_access_token,
+            user=user,
+            user_password=seed_password,
+            role_representations=role_representations,
+            managed_role_names=managed_role_names,
+        )
+        seeded_user_subjects[user.username] = user_subject
+
+    write_step("Validating checked-in catalog media assets")
+    studios = build_local_seed_studios()
+    titles = build_local_seed_titles(studios)
+    media_root = (config.repo_root / LOCAL_SEED_IMAGE_BASE_PATH).resolve()
+    validate_local_seed_media_assets(
+        titles=titles,
+        studios=studios,
+        media_root=media_root,
+        reset_media=reset_media,
+        config=config,
+    )
+
+    write_step("Applying backend database migrations")
+    apply_backend_database_migrations(config)
+
+    write_step("Populating PostgreSQL seed data")
+    sql_script = build_local_seed_sql_script(
+        users=users,
+        user_subjects=seeded_user_subjects,
+        studios=studios,
+        titles=titles,
+        media_root=media_root,
+    )
+    execute_postgres_sql(config, sql_script)
+
+    print("Local seed data is ready.")
+    print("Seed users use password:", seed_password)
+    print("Static media root:", media_root)
+
+
+def ensure_keycloak_running_for_seed(config: DevConfig) -> None:
+    """Ensure Keycloak is running and reachable before seed operations.
+
+    Args:
+        config: CLI configuration containing Keycloak container settings.
+
+    Returns:
+        None.
+
+    Raises:
+        DevCliError: If Keycloak is unavailable.
+    """
+
+    keycloak_state = get_docker_container_state(config.keycloak_container_name)
+    if keycloak_state != "running":
+        raise DevCliError(
+            f"Keycloak container '{config.keycloak_container_name}' is not running. "
+            "Start dependencies first with 'python ./scripts/dev.py up --dependencies-only'."
+        )
+
+    wait_for_http_ready(
+        url=config.keycloak_ready_url,
+        description="Keycloak",
+        timeout_seconds=KEYCLOAK_READY_TIMEOUT_SECONDS,
+    )
+
+
+def apply_backend_database_migrations(config: DevConfig) -> None:
+    """Apply backend EF Core migrations before local seed operations.
+
+    Args:
+        config: CLI configuration containing the backend project path.
+
+    Returns:
+        None.
+    """
+
+    backend_project = config.repo_root / config.backend_project
+    run_command(
+        [
+            "dotnet",
+            "ef",
+            "database",
+            "update",
+            "--project",
+            str(backend_project),
+            "--startup-project",
+            str(backend_project),
+            "--no-build",
+        ],
+        cwd=config.repo_root,
+    )
+
+
+def resolve_keycloak_seed_context(config: DevConfig) -> tuple[str, str]:
+    """Resolve the local Keycloak base URL and realm from CLI configuration.
+
+    Args:
+        config: CLI configuration.
+
+    Returns:
+        Tuple of ``(base_url, realm_name)``.
+    """
+
+    parsed = urllib.parse.urlparse(config.keycloak_ready_url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if len(path_parts) >= 2 and path_parts[0] == "realms":
+        return base_url, path_parts[1]
+    return base_url, LOCAL_KEYCLOAK_DEFAULT_REALM
+
+
+def keycloak_admin_request(
+    *,
+    keycloak_base_url: str,
+    path: str,
+    method: str,
+    admin_access_token: str,
+    payload: dict[str, Any] | list[dict[str, Any]] | None = None,
+    expect_json: bool = True,
+    allow_not_found: bool = False,
+) -> Any | None:
+    """Invoke the Keycloak admin API with local TLS relaxation.
+
+    Args:
+        keycloak_base_url: Keycloak base URL.
+        path: Admin path starting with ``/``.
+        method: HTTP method.
+        admin_access_token: Admin bearer token.
+        payload: Optional JSON payload.
+        expect_json: Whether to parse the response payload as JSON.
+        allow_not_found: Whether HTTP 404 should return ``None``.
+
+    Returns:
+        Parsed JSON payload, raw text payload, or ``None``.
+
+    Raises:
+        DevCliError: If the admin API returns an error.
+    """
+
+    url = f"{keycloak_base_url.rstrip('/')}{path}"
+    request_headers = {
+        "Authorization": f"Bearer {admin_access_token}",
+        "Accept": "application/json",
+    }
+    body: bytes | None = None
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        request_headers["Content-Type"] = "application/json"
+
+    request = urllib.request.Request(url, method=method, data=body, headers=request_headers)
+    context = ssl._create_unverified_context()
+
+    try:
+        with urllib.request.urlopen(request, context=context, timeout=30) as response:
+            raw = response.read()
+            if not raw:
+                return None
+            if expect_json:
+                return json.loads(raw.decode("utf-8"))
+            return raw.decode("utf-8")
+    except urllib.error.HTTPError as ex:
+        if allow_not_found and ex.code == 404:
+            return None
+
+        error_payload = ex.read().decode("utf-8", errors="replace").strip()
+        detail = f"HTTP {ex.code} {ex.reason}"
+        if error_payload:
+            detail = f"{detail}: {error_payload}"
+        raise DevCliError(f"Keycloak admin request failed ({method} {path}). {detail}") from ex
+    except urllib.error.URLError as ex:
+        raise DevCliError(f"Keycloak admin request failed ({method} {path}). {ex}") from ex
+
+
+def get_keycloak_admin_access_token(*, keycloak_base_url: str, admin_username: str, admin_password: str) -> str:
+    """Acquire a Keycloak admin token from the local master realm.
+
+    Args:
+        keycloak_base_url: Keycloak base URL.
+        admin_username: Keycloak admin username.
+        admin_password: Keycloak admin password.
+
+    Returns:
+        Access token string.
+
+    Raises:
+        DevCliError: If token acquisition fails.
+    """
+
+    token_url = f"{keycloak_base_url.rstrip('/')}/realms/master/protocol/openid-connect/token"
+    payload = urllib.parse.urlencode(
+        {
+            "grant_type": "password",
+            "client_id": "admin-cli",
+            "username": admin_username,
+            "password": admin_password,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        token_url,
+        method="POST",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    context = ssl._create_unverified_context()
+
+    try:
+        with urllib.request.urlopen(request, context=context, timeout=30) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as ex:
+        detail = ex.read().decode("utf-8", errors="replace").strip()
+        raise DevCliError(f"Keycloak admin token request failed: HTTP {ex.code} {ex.reason}. {detail}") from ex
+    except urllib.error.URLError as ex:
+        raise DevCliError(f"Keycloak admin token request failed: {ex}") from ex
+
+    access_token = body.get("access_token")
+    if not isinstance(access_token, str) or not access_token.strip():
+        raise DevCliError("Keycloak admin token response did not include access_token.")
+    return access_token
+
+
+def ensure_keycloak_realm_roles(
+    *,
+    keycloak_base_url: str,
+    keycloak_realm: str,
+    admin_access_token: str,
+    role_names: Sequence[str],
+) -> None:
+    """Ensure required realm roles exist for local seed users.
+
+    Args:
+        keycloak_base_url: Keycloak base URL.
+        keycloak_realm: Realm name.
+        admin_access_token: Admin bearer token.
+        role_names: Role names that must exist.
+
+    Returns:
+        None.
+    """
+
+    for role_name in role_names:
+        existing = keycloak_admin_request(
+            keycloak_base_url=keycloak_base_url,
+            path=f"/admin/realms/{urllib.parse.quote(keycloak_realm, safe='')}/roles/{urllib.parse.quote(role_name, safe='')}",
+            method="GET",
+            admin_access_token=admin_access_token,
+            allow_not_found=True,
+        )
+        if existing is not None:
+            continue
+
+        keycloak_admin_request(
+            keycloak_base_url=keycloak_base_url,
+            path=f"/admin/realms/{urllib.parse.quote(keycloak_realm, safe='')}/roles",
+            method="POST",
+            admin_access_token=admin_access_token,
+            payload={"name": role_name, "description": f"Seeded role '{role_name}' for local development."},
+            expect_json=False,
+        )
+
+
+def get_keycloak_realm_role(
+    *,
+    keycloak_base_url: str,
+    keycloak_realm: str,
+    admin_access_token: str,
+    role_name: str,
+) -> dict[str, Any]:
+    """Fetch a realm role representation from Keycloak.
+
+    Args:
+        keycloak_base_url: Keycloak base URL.
+        keycloak_realm: Realm name.
+        admin_access_token: Admin bearer token.
+        role_name: Role name to fetch.
+
+    Returns:
+        Role representation payload.
+
+    Raises:
+        DevCliError: If the payload is invalid.
+    """
+
+    role = keycloak_admin_request(
+        keycloak_base_url=keycloak_base_url,
+        path=f"/admin/realms/{urllib.parse.quote(keycloak_realm, safe='')}/roles/{urllib.parse.quote(role_name, safe='')}",
+        method="GET",
+        admin_access_token=admin_access_token,
+    )
+    if not isinstance(role, dict) or "name" not in role:
+        raise DevCliError(f"Keycloak returned an invalid role representation for '{role_name}'.")
+    return role
+
+
+def upsert_keycloak_user(
+    *,
+    keycloak_base_url: str,
+    keycloak_realm: str,
+    admin_access_token: str,
+    user: LocalSeedUser,
+    user_password: str,
+    role_representations: dict[str, dict[str, Any]],
+    managed_role_names: Sequence[str],
+) -> str:
+    """Create or update a deterministic local Keycloak user and role mapping.
+
+    Args:
+        keycloak_base_url: Keycloak base URL.
+        keycloak_realm: Realm name.
+        admin_access_token: Admin bearer token.
+        user: User spec to apply.
+        user_password: Password assigned to the user.
+        role_representations: Map of role name to Keycloak role payload.
+        managed_role_names: Role names controlled by this seeding workflow.
+
+    Returns:
+        User subject identifier.
+    """
+
+    encoded_realm = urllib.parse.quote(keycloak_realm, safe="")
+    encoded_username = urllib.parse.quote(user.username, safe="")
+    existing_users = keycloak_admin_request(
+        keycloak_base_url=keycloak_base_url,
+        path=f"/admin/realms/{encoded_realm}/users?username={encoded_username}&exact=true",
+        method="GET",
+        admin_access_token=admin_access_token,
+    )
+    if not isinstance(existing_users, list):
+        raise DevCliError(f"Unexpected Keycloak user lookup payload for '{user.username}'.")
+
+    user_payload = {
+        "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/users/{user.username}")),
+        "username": user.username,
+        "enabled": True,
+        "firstName": user.first_name,
+        "lastName": user.last_name,
+        "email": user.email,
+        "emailVerified": True,
+    }
+
+    if existing_users:
+        keycloak_user_id = existing_users[0].get("id")
+        if not isinstance(keycloak_user_id, str) or not keycloak_user_id.strip():
+            raise DevCliError(f"Keycloak user lookup returned an invalid ID for '{user.username}'.")
+
+        keycloak_admin_request(
+            keycloak_base_url=keycloak_base_url,
+            path=f"/admin/realms/{encoded_realm}/users/{urllib.parse.quote(keycloak_user_id, safe='')}",
+            method="PUT",
+            admin_access_token=admin_access_token,
+            payload={**user_payload, "id": keycloak_user_id},
+            expect_json=False,
+        )
+    else:
+        keycloak_admin_request(
+            keycloak_base_url=keycloak_base_url,
+            path=f"/admin/realms/{encoded_realm}/users",
+            method="POST",
+            admin_access_token=admin_access_token,
+            payload=user_payload,
+            expect_json=False,
+        )
+        refreshed_users = keycloak_admin_request(
+            keycloak_base_url=keycloak_base_url,
+            path=f"/admin/realms/{encoded_realm}/users?username={encoded_username}&exact=true",
+            method="GET",
+            admin_access_token=admin_access_token,
+        )
+        if not isinstance(refreshed_users, list) or not refreshed_users:
+            raise DevCliError(f"Keycloak user '{user.username}' was created but could not be reloaded.")
+        keycloak_user_id = refreshed_users[0].get("id")
+        if not isinstance(keycloak_user_id, str) or not keycloak_user_id.strip():
+            raise DevCliError(f"Keycloak user lookup returned an invalid ID for '{user.username}'.")
+
+    keycloak_admin_request(
+        keycloak_base_url=keycloak_base_url,
+        path=f"/admin/realms/{encoded_realm}/users/{urllib.parse.quote(keycloak_user_id, safe='')}/reset-password",
+        method="PUT",
+        admin_access_token=admin_access_token,
+        payload={
+            "type": "password",
+            "temporary": False,
+            "value": user_password,
+        },
+        expect_json=False,
+    )
+
+    current_roles = keycloak_admin_request(
+        keycloak_base_url=keycloak_base_url,
+        path=f"/admin/realms/{encoded_realm}/users/{urllib.parse.quote(keycloak_user_id, safe='')}/role-mappings/realm",
+        method="GET",
+        admin_access_token=admin_access_token,
+    )
+    if not isinstance(current_roles, list):
+        raise DevCliError(f"Unexpected role payload returned for '{user.username}'.")
+
+    current_role_names = {
+        role.get("name")
+        for role in current_roles
+        if isinstance(role, dict) and isinstance(role.get("name"), str)
+    }
+    desired_role_names = set(user.roles)
+    managed_role_set = set(managed_role_names)
+    roles_to_remove = sorted((current_role_names & managed_role_set) - desired_role_names, key=str.casefold)
+    roles_to_add = sorted(desired_role_names - current_role_names, key=str.casefold)
+
+    if roles_to_remove:
+        keycloak_admin_request(
+            keycloak_base_url=keycloak_base_url,
+            path=f"/admin/realms/{encoded_realm}/users/{urllib.parse.quote(keycloak_user_id, safe='')}/role-mappings/realm",
+            method="DELETE",
+            admin_access_token=admin_access_token,
+            payload=[role_representations[role_name] for role_name in roles_to_remove],
+            expect_json=False,
+        )
+
+    if roles_to_add:
+        keycloak_admin_request(
+            keycloak_base_url=keycloak_base_url,
+            path=f"/admin/realms/{encoded_realm}/users/{urllib.parse.quote(keycloak_user_id, safe='')}/role-mappings/realm",
+            method="POST",
+            admin_access_token=admin_access_token,
+            payload=[role_representations[role_name] for role_name in roles_to_add],
+            expect_json=False,
+        )
+
+    return keycloak_user_id
+
+
+def build_local_seed_users() -> list[LocalSeedUser]:
+    """Build deterministic local seed users across platform access levels.
+
+    Returns:
+        Ordered local seed user list.
+    """
+
+    return [
+        LocalSeedUser("alex.rivera", "Alex", "Rivera", ("player", "moderator", "admin", "super_admin")),
+        LocalSeedUser("morgan.lee", "Morgan", "Lee", ("player", "admin")),
+        LocalSeedUser("samir.khan", "Samir", "Khan", ("player", "admin")),
+        LocalSeedUser("jordan.ellis", "Jordan", "Ellis", ("player", "moderator")),
+        LocalSeedUser("casey.nguyen", "Casey", "Nguyen", ("player", "moderator")),
+        LocalSeedUser("riley.patel", "Riley", "Patel", ("player", "moderator")),
+        LocalSeedUser("emma.torres", "Emma", "Torres", ("player", "developer", "verified_developer")),
+        LocalSeedUser("liam.chen", "Liam", "Chen", ("player", "developer", "verified_developer")),
+        LocalSeedUser("noah.walters", "Noah", "Walters", ("player", "developer", "verified_developer")),
+        LocalSeedUser("maya.singh", "Maya", "Singh", ("player", "developer", "verified_developer")),
+        LocalSeedUser("olivia.bennett", "Olivia", "Bennett", ("player", "developer")),
+        LocalSeedUser("ethan.foster", "Ethan", "Foster", ("player", "developer")),
+        LocalSeedUser("amelia.park", "Amelia", "Park", ("player", "developer")),
+        LocalSeedUser("lucas.hughes", "Lucas", "Hughes", ("player", "developer")),
+        LocalSeedUser("zoe.martin", "Zoe", "Martin", ("player", "developer")),
+        LocalSeedUser("isaac.romero", "Isaac", "Romero", ("player", "developer")),
+        LocalSeedUser("ava.garcia", "Ava", "Garcia", ("player",)),
+        LocalSeedUser("mia.collins", "Mia", "Collins", ("player",)),
+        LocalSeedUser("nora.bailey", "Nora", "Bailey", ("player",)),
+        LocalSeedUser("owen.brooks", "Owen", "Brooks", ("player",)),
+    ]
+
+
+def build_local_seed_studios() -> list[LocalSeedStudio]:
+    """Build deterministic studios for local UX data validation.
+
+    Returns:
+        Ordered studio list.
+    """
+
+    return [
+        LocalSeedStudio(
+            "blue-harbor-games",
+            "Blue Harbor Games",
+            "Co-op adventures with bright maritime themes and approachable controls.",
+            "emma.torres",
+            (
+                ("Discord", "https://discord.gg/blueharborgames"),
+                ("YouTube", "https://www.youtube.com/@BlueHarborGames"),
+                ("Press Kit", "https://blueharborgames.example/press"),
+            )),
+        LocalSeedStudio(
+            "pine-lantern-labs",
+            "Pine Lantern Labs",
+            "Narrative puzzle team focused on campfire mystery and family play.",
+            "emma.torres",
+            (
+                ("Instagram", "https://www.instagram.com/pinelanternlabs"),
+                ("Discord", "https://discord.gg/pinelanternlabs"),
+                ("Community Wiki", "https://pinelanternlabs.example/wiki"),
+            )),
+        LocalSeedStudio(
+            "quartz-rabbit-studio",
+            "Quartz Rabbit Studio",
+            "Fast-action arcade experiments with local and online score races.",
+            "liam.chen",
+            (
+                ("X", "https://x.com/quartzrabbit"),
+                ("TikTok", "https://www.tiktok.com/@quartzrabbit"),
+                ("Support", "https://quartzrabbit.example/support"),
+            )),
+        LocalSeedStudio(
+            "north-maple-interactive",
+            "North Maple Interactive",
+            "Strategic board-inspired designs for quick sessions and tournaments.",
+            "noah.walters",
+            (
+                ("LinkedIn", "https://www.linkedin.com/company/north-maple-interactive"),
+                ("Facebook", "https://www.facebook.com/northmapleinteractive"),
+                ("Storefront", "https://northmaple.example/store"),
+            )),
+        LocalSeedStudio(
+            "copper-finch-works",
+            "Copper Finch Works",
+            "Whimsical creature sims and cozy exploration for all ages.",
+            "maya.singh",
+            (
+                ("Instagram", "https://www.instagram.com/copperfinchworks"),
+                ("Discord", "https://discord.gg/copperfinchworks"),
+                ("Newsletter", "https://copperfinch.example/newsletter"),
+            )),
+        LocalSeedStudio(
+            "lumen-cartography",
+            "Lumen Cartography",
+            "Tooling-led studio building companion apps and interactive map systems.",
+            "olivia.bennett",
+            (
+                ("GitHub", "https://github.com/lumen-cartography"),
+                ("LinkedIn", "https://www.linkedin.com/company/lumen-cartography"),
+                ("Docs", "https://lumen-cartography.example/docs"),
+            )),
+        LocalSeedStudio(
+            "tiny-orbit-forge",
+            "Tiny Orbit Forge",
+            "Sci-fi builders featuring modular crafting and community challenges.",
+            "ethan.foster",
+            (
+                ("YouTube", "https://www.youtube.com/@TinyOrbitForge"),
+                ("Discord", "https://discord.gg/tinyorbitforge"),
+                ("Creator Blog", "https://tinyorbitforge.example/blog"),
+            )),
+        LocalSeedStudio(
+            "moss-byte-collective",
+            "Moss Byte Collective",
+            "Experimental co-op projects mixing rhythm, puzzle, and narrative beats.",
+            "amelia.park",
+            (
+                ("X", "https://x.com/mossbytecollective"),
+                ("Discord", "https://discord.gg/mossbytecollective"),
+                ("Bandcamp", "https://mossbytecollective.example/soundtrack"),
+            )),
+        LocalSeedStudio(
+            "harborlight-mechanics",
+            "Harborlight Mechanics",
+            "Competitive strategy and logistics play tuned for weekend sessions.",
+            "lucas.hughes",
+            (
+                ("Facebook", "https://www.facebook.com/harborlightmechanics"),
+                ("YouTube", "https://www.youtube.com/@HarborlightMechanics"),
+                ("Tournament Hub", "https://harborlight.example/tournaments"),
+            )),
+    ]
+
+
+def build_local_seed_titles(studios: Sequence[LocalSeedStudio]) -> list[dict[str, Any]]:
+    """Create deterministic title payloads with mixed genres, status, and imagery.
+
+    Args:
+        studios: Seed studios.
+
+    Returns:
+        List of title dictionaries ready for media generation and SQL emission.
+    """
+
+    title_concepts: list[dict[str, Any]] = [
+        {
+            "display_name": "Signal Harbor",
+            "content_kind": "game",
+            "genre_set": ("Strategy", "Defense"),
+            "short_description": "Command a storm-battered harbor and outmaneuver raiders with clever beacon chains.",
+            "description": "Chain lighthouses, reroute cargo fleets, and trap raiders in a tense coastal strategy game built around shifting tides and line-of-sight control."
+        },
+        {
+            "display_name": "Lantern Drift",
+            "content_kind": "game",
+            "genre_set": ("Puzzle", "Family"),
+            "short_description": "Guide glowing paper boats through a midnight canal festival without snuffing the flame.",
+            "description": "Tilt waterways, spin lock-gates, and weave through fireworks as every lantern casts new puzzle shadows across the river."
+        },
+        {
+            "display_name": "Solar Orchard",
+            "content_kind": "game",
+            "genre_set": ("Simulation", "Building", "Management"),
+            "short_description": "Grow a radiant orchard beneath mirrored suns and keep the colony thriving.",
+            "description": "Balance irrigation drones, fruit mutations, and solar weather inside a lush sci-fi orchard where every harvest reshapes the biome."
+        },
+        {
+            "display_name": "Compass Echo",
+            "content_kind": "app",
+            "genre_set": ("Companion", "Utility", "Exploration"),
+            "short_description": "Plot expedition routes, track secrets, and sync clue boards for sprawling adventures.",
+            "description": "Compass Echo is a premium companion app for campaign nights, with layered maps, route planning, and clue pinning for cooperative exploration games."
+        },
+        {
+            "display_name": "Circuit Garden",
+            "content_kind": "game",
+            "genre_set": ("Sandbox", "Automation", "Puzzle"),
+            "short_description": "Wire a neon greenhouse where every vine, drone, and sprinkler can be automated.",
+            "description": "Create playful machine ecosystems in a glowing bio-lab, solving spatial automation puzzles with modular circuits and responsive plant life."
+        },
+        {
+            "display_name": "Nebula Relay",
+            "content_kind": "game",
+            "genre_set": ("Adventure", "Co-op", "Sci-Fi"),
+            "short_description": "Sprint cargo through collapsing star gates before the relay burns out.",
+            "description": "Pilot courier crews through shattered nebula highways, hopping between stations, hazard fields, and gravity storms in fast cooperative runs."
+        },
+        {
+            "display_name": "Stonepath Rally",
+            "content_kind": "game",
+            "genre_set": ("Arcade", "Racing", "Action"),
+            "short_description": "Drift armored buggies across cliffside roads carved through ancient stone.",
+            "description": "Boost through canyon switchbacks, dodge rockslides, and slam through shortcuts in a rally game built for split-second decisions and dusty spectacle."
+        },
+        {
+            "display_name": "Clockwork Crew",
+            "content_kind": "game",
+            "genre_set": ("Co-op", "Crafting", "Family"),
+            "short_description": "Run a runaway toy workshop with tiny engineers and too many gears.",
+            "description": "Coordinate a charming crew of wind-up workers, assemble contraptions, and keep the shop from shaking itself apart during chaotic co-op shifts."
+        },
+        {
+            "display_name": "Moonlight Ledger",
+            "content_kind": "game",
+            "genre_set": ("Simulation", "Story Rich", "Mystery"),
+            "short_description": "Balance a hidden city's books by candlelight while unraveling its secrets.",
+            "description": "Sort ledgers, decode midnight transactions, and decide who to trust in a moody narrative sim set inside a city that only appears after dusk."
+        },
+        {
+            "display_name": "Riverlight Quest",
+            "content_kind": "game",
+            "genre_set": ("Adventure", "Co-op", "Story Rich"),
+            "short_description": "Follow luminous river spirits through canyons, ruins, and forgotten gardens.",
+            "description": "Traverse painterly wilderness, solve shrine puzzles, and escort river spirits toward a vanished capital in a warm cooperative adventure."
+        },
+        {
+            "display_name": "Parade of Sparks",
+            "content_kind": "game",
+            "genre_set": ("Rhythm", "Music", "Party"),
+            "short_description": "Lead a firework parade where every beat launches a new burst across the sky.",
+            "description": "Drum, dance, and trigger synchronized pyrotechnics across crowded streets in a celebratory rhythm game tuned for loud local sessions."
+        },
+        {
+            "display_name": "Anchorpoint Atlas",
+            "content_kind": "game",
+            "genre_set": ("Adventure", "Puzzle", "Travel"),
+            "short_description": "Globe-hop through glamorous seaside cities in search of a vanished mapmaker.",
+            "description": "Crack location-based riddles, uncover mid-century landmarks, and chase a stylish conspiracy from boardwalks to cliffside villas."
+        },
+        {
+            "display_name": "Starlane Sprint",
+            "content_kind": "game",
+            "genre_set": ("Arcade", "Racing", "Sci-Fi"),
+            "short_description": "Rocket through neon skyways above a city that never powers down.",
+            "description": "Master anti-grav corners, thread through transit lanes, and blaze past holographic billboards in a velocity-first arcade racer."
+        },
+        {
+            "display_name": "Fjord Frontier",
+            "content_kind": "game",
+            "genre_set": ("RPG", "Adventure", "Exploration"),
+            "short_description": "Chart frozen fjords, scale ruined watchtowers, and survive the northern dark.",
+            "description": "Forge camp routes, battle whiteout storms, and uncover relics beneath glacial cliffs in a cinematic expedition RPG."
+        },
+        {
+            "display_name": "Patchwork Port",
+            "content_kind": "game",
+            "genre_set": ("Building", "Management", "Cozy"),
+            "short_description": "Rebuild a sun-faded harbor town one stitched-together district at a time.",
+            "description": "Lay colorful neighborhoods, restore market squares, and welcome quirky residents to a relaxing harbor builder with handcrafted charm."
+        },
+        {
+            "display_name": "Nightglass Tactics",
+            "content_kind": "game",
+            "genre_set": ("Strategy", "Tactics", "Noir"),
+            "short_description": "Stage precision heists across skyscrapers made of mirrored black glass.",
+            "description": "Move operatives through rain-soaked rooftops, control sightlines, and turn reflections into weapons in a sharp neo-noir tactics game."
+        },
+        {
+            "display_name": "Orbit Orchard",
+            "content_kind": "game",
+            "genre_set": ("Simulation", "Sandbox", "Sci-Fi"),
+            "short_description": "Cultivate fruit rings around a tiny planet in zero gravity.",
+            "description": "Build spinning orchards, redirect sunlight, and juggle floating harvest bots in a bright orbital farming sandbox."
+        },
+        {
+            "display_name": "Marble Meridian",
+            "content_kind": "game",
+            "genre_set": ("Puzzle", "Abstract", "Family"),
+            "short_description": "Roll glass marbles through impossible sculpture gardens of color and light.",
+            "description": "Solve elegant momentum puzzles across abstract monuments, mirrored tracks, and gravity-bending marble courses."
+        },
+        {
+            "display_name": "Signal Syndicate",
+            "content_kind": "game",
+            "genre_set": ("Action", "Adventure", "Cyberpunk"),
+            "short_description": "Hijack the city feed and expose a corporate blackout one rooftop at a time.",
+            "description": "Dash through neon high-rises, breach surveillance grids, and evade drone swarms in a fast cyberpunk infiltration campaign."
+        },
+        {
+            "display_name": "Trailblazer Terminal",
+            "content_kind": "app",
+            "genre_set": ("Utility", "Companion", "Productivity"),
+            "short_description": "Plan routes, save checkpoints, and coordinate travel for long-form campaign play.",
+            "description": "Trailblazer Terminal is a route-planning and session-ops app for campaigns that span dozens of locations, side objectives, and shared inventories."
+        },
+        {
+            "display_name": "Cinderline Workshop",
+            "content_kind": "game",
+            "genre_set": ("Crafting", "Simulation", "Management"),
+            "short_description": "Smelt impossible metals and build heirloom machines in a volcanic forge-town.",
+            "description": "Manage artisans, fuel towering furnaces, and turn molten experiments into prized commissions in a dramatic crafting sim."
+        },
+        {
+            "display_name": "Mosaic Drift",
+            "content_kind": "game",
+            "genre_set": ("Puzzle", "Abstract", "Relaxing"),
+            "short_description": "Slide luminous tiles through a dreamlike gallery of moving murals.",
+            "description": "Reassemble giant living mosaics by shifting color, rhythm, and reflection across serene abstract puzzle spaces."
+        },
+        {
+            "display_name": "Echo Harborline",
+            "content_kind": "game",
+            "genre_set": ("Adventure", "Mystery", "Story Rich"),
+            "short_description": "Ride a ghost train down the coast and interview every passenger before dawn.",
+            "description": "Investigate missing signals, solve carriage-room mysteries, and piece together a seaside disappearance aboard a haunted late-night rail line."
+        },
+        {
+            "display_name": "Pioneer Broadcast",
+            "content_kind": "app",
+            "genre_set": ("Creator Tools", "Automation", "Cloud"),
+            "short_description": "Design polished show packages, alerts, and overlays for community broadcasts.",
+            "description": "Pioneer Broadcast gives stream teams scene automation, event triggers, and branded templates for live community showcases."
+        },
+        {
+            "display_name": "Cascade Courier",
+            "content_kind": "game",
+            "genre_set": ("Platformer", "Adventure", "Action"),
+            "short_description": "Leap waterfalls, zipline ravines, and deliver fragile cargo against the clock.",
+            "description": "Chain movement tricks through mountain villages, storm drains, and canyon cranes in a courier platformer built around momentum."
+        },
+        {
+            "display_name": "Festival Foundry",
+            "content_kind": "game",
+            "genre_set": ("Party", "Crafting", "Family"),
+            "short_description": "Build giant parade creatures and set the whole city dancing.",
+            "description": "Gather materials, improvise absurd festival floats, and trigger cheerful disasters in a colorful party game about collaborative making."
+        },
+        {
+            "display_name": "Beacon Boardwalk",
+            "content_kind": "game",
+            "genre_set": ("Strategy", "Board Game", "Family"),
+            "short_description": "Claim glowing promenade routes and outscore rivals before high tide hits.",
+            "description": "Lay kiosks, steer tourist traffic, and chain beacon towers across a rain-slick amusement pier in a board-inspired strategy showdown."
+        },
+        {
+            "display_name": "Cloudline Studio",
+            "content_kind": "app",
+            "genre_set": ("Creator Tools", "Productivity", "Cloud"),
+            "short_description": "Storyboard releases, marketing beats, and media kits from one polished workspace.",
+            "description": "Cloudline Studio helps small teams organize title pages, media drops, and launch checklists with a clean cloud-first publishing dashboard."
+        },
+        {
+            "display_name": "Cobalt Almanac",
+            "content_kind": "app",
+            "genre_set": ("Productivity", "Reference", "Utility"),
+            "short_description": "Track seasonal events, notes, and campaign lore in a glowing modular codex.",
+            "description": "Cobalt Almanac is a richly visual lorebook and planning app with timeline cards, searchable notes, and shareable seasonal calendars."
+        },
+        {
+            "display_name": "Hearthside Protocol",
+            "content_kind": "game",
+            "genre_set": ("Co-op", "Survival", "Story Rich"),
+            "short_description": "Keep one last mountain refuge alive through the longest winter on record.",
+            "description": "Scavenge supplies, restore heat, and make hard communal choices inside a snowbound refuge where every room tells a personal story."
+        },
+    ]
+
+    seen_slugs: set[str] = set()
+    titles: list[dict[str, Any]] = []
+    title_index = 0
+
+    for studio_index, studio in enumerate(studios):
+        for local_index in range(3):
+            concept = title_concepts[title_index % len(title_concepts)]
+            name = str(concept["display_name"])
+            slug = slugify_for_seed(name)
+            while slug in seen_slugs:
+                slug = f"{slug}-{title_index + 1}"
+            seen_slugs.add(slug)
+
+            genre_set = tuple(str(candidate) for candidate in concept["genre_set"])
+            content_kind = str(concept["content_kind"])
+            lifecycle_status = (
+                "draft" if title_index % 6 == 0 else
+                "testing" if title_index % 4 == 0 else
+                "published"
+            )
+            visibility = (
+                "private" if lifecycle_status == "draft" and title_index % 2 == 0 else
+                "unlisted" if lifecycle_status != "published" else
+                "listed"
+            )
+
+            min_players = 1 if content_kind == "app" else 1 + (title_index % 2)
+            max_players = min_players if content_kind == "app" else max(min_players + 1, min_players + (title_index % 4))
+            min_age_years = 6 + (title_index % 8)
+            age_rating_value = "E" if min_age_years <= 7 else "E10+" if min_age_years <= 11 else "T"
+
+            short_description = str(concept["short_description"])
+            description = f"{concept['description']} Developed by {studio.display_name}."
+
+            titles.append(
+                {
+                    "title_index": title_index,
+                    "studio_slug": studio.slug,
+                    "display_name": name,
+                    "slug": slug,
+                    "content_kind": content_kind,
+                    "lifecycle_status": lifecycle_status,
+                    "visibility": visibility,
+                    "short_description": short_description,
+                    "description": description,
+                    "genre_display": ", ".join(genre_set),
+                    "min_players": min_players,
+                    "max_players": max_players,
+                    "age_rating_authority": "ESRB",
+                    "age_rating_value": age_rating_value,
+                    "min_age_years": min_age_years,
+                    "media_assignments": get_media_assignment_for_title(title_index),
+                }
+            )
+
+            title_index += 1
+
+    return titles
+
+
+def get_media_assignment_for_title(title_index: int) -> set[str]:
+    """Return assigned media roles for a title while preserving intentional gaps.
+
+    Args:
+        title_index: Zero-based title index.
+
+    Returns:
+        Assigned media role set.
+    """
+
+    assigned = {"card", "hero", "logo"}
+    if title_index % 4 == 0:
+        assigned.discard("logo")
+    if title_index % 6 == 0:
+        assigned.discard("hero")
+    if title_index % 9 == 0:
+        assigned.discard("card")
+    if not assigned:
+        assigned.add("card")
+    return assigned
+
+
+def slugify_for_seed(value: str) -> str:
+    """Normalize a display string into a kebab-case seed slug.
+
+    Args:
+        value: Source value.
+
+    Returns:
+        Kebab-case slug.
+    """
+
+    normalized = [
+        character.lower() if character.isalnum() else "-"
+        for character in value.strip()
+    ]
+    slug = "".join(normalized)
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug.strip("-")
+
+
+def validate_local_seed_media_assets(
+    *,
+    titles: Sequence[dict[str, Any]],
+    studios: Sequence[LocalSeedStudio],
+    media_root: Path,
+    reset_media: bool,
+    config: DevConfig,
+) -> None:
+    """Validate checked-in seed media bundles and optionally clear legacy generated output.
+
+    Args:
+        titles: Seed title payloads.
+        studios: Seed studios.
+        media_root: Checked-in static media root path.
+        reset_media: Whether to remove the obsolete generated-media directory.
+        config: CLI configuration for resolving repository paths.
+
+    Returns:
+        None.
+
+    Raises:
+        DevCliError: If any required media asset is missing.
+    """
+
+    if not media_root.exists():
+        raise DevCliError(f"Checked-in seed media root was not found: {media_root}")
+
+    missing_assets: list[str] = []
+    for studio in studios:
+        studio_logo_path = media_root / 'studios' / studio.slug / 'logo.svg'
+        studio_banner_png_path = media_root / 'studios' / studio.slug / 'banner.png'
+        studio_banner_svg_path = media_root / 'studios' / studio.slug / 'banner.svg'
+        if not studio_logo_path.exists():
+            missing_assets.append(str(studio_logo_path.relative_to(config.repo_root)))
+        if not studio_banner_png_path.exists() and not studio_banner_svg_path.exists():
+            missing_assets.append(str(studio_banner_svg_path.relative_to(config.repo_root)))
+
+    for title in titles:
+        title_slug = str(title['slug'])
+        title_directory = media_root / title_slug
+        for media_role in ('card', 'hero', 'logo'):
+            expected_path = title_directory / f'{media_role}.png'
+            if not expected_path.exists():
+                missing_assets.append(str(expected_path.relative_to(config.repo_root)))
+
+    if missing_assets:
+        preview = "\n".join(missing_assets[:20])
+        remainder = len(missing_assets) - min(20, len(missing_assets))
+        suffix = f"\n...and {remainder} more" if remainder > 0 else ""
+        raise DevCliError(f"Checked-in seed media assets are missing:\n{preview}{suffix}")
+
+    if reset_media:
+        legacy_root = config.repo_root / LEGACY_LOCAL_SEED_GENERATED_IMAGE_PATH
+        if legacy_root.exists():
+            shutil.rmtree(legacy_root)
+
+
+def build_local_seed_sql_script(
+    *,
+    users: Sequence[LocalSeedUser],
+    user_subjects: dict[str, str],
+    studios: Sequence[LocalSeedStudio],
+    titles: Sequence[dict[str, Any]],
+    media_root: Path,
+) -> str:
+    """Build SQL script for deterministic local seed data insertion.
+
+    Args:
+        users: Seed users.
+        user_subjects: Map of username to Keycloak subject.
+        studios: Seed studios.
+        titles: Seed titles.
+
+    Returns:
+        SQL script text.
+    """
+
+    now = datetime.now(timezone.utc)
+    sql_lines = [
+        "BEGIN;",
+        "TRUNCATE TABLE release_artifacts, title_releases, title_media_assets, title_integration_bindings, integration_connections, title_metadata_versions, titles, studio_links, studio_memberships, studios, user_board_profiles RESTART IDENTITY CASCADE;",
+    ]
+
+    app_user_ids: dict[str, str] = {}
+    for user in users:
+        subject = user_subjects.get(user.username)
+        if not subject:
+            raise DevCliError(f"Missing Keycloak subject for seeded user '{user.username}'.")
+
+        app_user_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/app-users/{subject}"))
+        app_user_ids[user.username] = app_user_id
+        avatar_url = f"https://api.dicebear.com/9.x/initials/svg?seed={urllib.parse.quote(user.display_name, safe='')}"
+        sql_lines.append(
+            "INSERT INTO users (id, keycloak_subject, display_name, user_name, first_name, last_name, email, email_verified, identity_provider, avatar_url, avatar_image_content_type, avatar_image_data, created_at, updated_at) "
+            f"VALUES ({sql_literal(app_user_id)}, {sql_literal(subject)}, {sql_literal(user.display_name)}, {sql_literal(user.username)}, {sql_literal(user.first_name)}, {sql_literal(user.last_name)}, {sql_literal(user.email)}, TRUE, 'keycloak', {sql_literal(avatar_url)}, NULL, NULL, {sql_literal(now)}, {sql_literal(now)}) "
+            "ON CONFLICT (keycloak_subject) DO UPDATE SET "
+            "display_name = EXCLUDED.display_name, "
+            "user_name = EXCLUDED.user_name, "
+            "first_name = EXCLUDED.first_name, "
+            "last_name = EXCLUDED.last_name, "
+            "email = EXCLUDED.email, "
+            "email_verified = EXCLUDED.email_verified, "
+            "identity_provider = EXCLUDED.identity_provider, "
+            "avatar_url = EXCLUDED.avatar_url, "
+            "updated_at = EXCLUDED.updated_at;"
+        )
+
+    for user in users[:8]:
+        user_id = app_user_ids[user.username]
+        board_user_id = f"board_{user.username.replace('.', '_')}"
+        sql_lines.append(
+            "INSERT INTO user_board_profiles (user_id, board_user_id, display_name, avatar_url, linked_at, last_synced_at, created_at, updated_at) "
+            f"VALUES ({sql_literal(user_id)}, {sql_literal(board_user_id)}, {sql_literal(user.display_name)}, {sql_literal(f'https://cdn.board.fun/avatars/{board_user_id}.png')}, {sql_literal(now)}, {sql_literal(now)}, {sql_literal(now)}, {sql_literal(now)});"
+        )
+
+    studio_ids: dict[str, str] = {}
+    for studio in studios:
+        studio_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/studios/{studio.slug}"))
+        studio_ids[studio.slug] = studio_id
+        logo_url = f"https://localhost:7277/test-images/seed-catalog/studios/{studio.slug}/logo.svg"
+        banner_path = media_root / "studios" / studio.slug / "banner.png"
+        banner_extension = "png" if banner_path.exists() and banner_path.suffix.lower() == ".png" else "svg"
+        banner_url = f"https://localhost:7277/test-images/seed-catalog/studios/{studio.slug}/banner.{banner_extension}"
+        sql_lines.append(
+            "INSERT INTO studios (id, slug, display_name, description, logo_url, banner_url, created_at, updated_at) "
+            f"VALUES ({sql_literal(studio_id)}, {sql_literal(studio.slug)}, {sql_literal(studio.display_name)}, {sql_literal(studio.description)}, {sql_literal(logo_url)}, {sql_literal(banner_url)}, {sql_literal(now)}, {sql_literal(now)});"
+        )
+        sql_lines.append(
+            "INSERT INTO studio_memberships (studio_id, user_id, role, created_at, updated_at) "
+            f"VALUES ({sql_literal(studio_id)}, {sql_literal(app_user_ids[studio.owner_username])}, 'owner', {sql_literal(now)}, {sql_literal(now)});"
+        )
+        for link_label, link_url in studio.links:
+            link_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/studio-links/{studio.slug}/{link_label}/{link_url}"))
+            sql_lines.append(
+                "INSERT INTO studio_links (id, studio_id, label, url, created_at, updated_at) "
+                f"VALUES ({sql_literal(link_id)}, {sql_literal(studio_id)}, {sql_literal(link_label)}, {sql_literal(link_url)}, {sql_literal(now)}, {sql_literal(now)});"
+            )
+
+    contributor_memberships = [
+        ("quartz-rabbit-studio", "zoe.martin", "editor"),
+        ("blue-harbor-games", "isaac.romero", "admin"),
+    ]
+    for studio_slug, username, membership_role in contributor_memberships:
+        sql_lines.append(
+            "INSERT INTO studio_memberships (studio_id, user_id, role, created_at, updated_at) "
+            f"VALUES ({sql_literal(studio_ids[studio_slug])}, {sql_literal(app_user_ids[username])}, {sql_literal(membership_role)}, {sql_literal(now)}, {sql_literal(now)});"
+        )
+
+    title_ids: dict[str, str] = {}
+    title_current_metadata_ids: dict[str, str] = {}
+    title_current_release_ids: dict[str, str | None] = {}
+
+    for title in titles:
+        title_slug = str(title["slug"])
+        title_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/titles/{title['studio_slug']}/{title_slug}"))
+        title_ids[title_slug] = title_id
+        sql_lines.append(
+            "INSERT INTO titles (id, studio_id, slug, content_kind, lifecycle_status, visibility, current_metadata_version_id, current_release_id, created_at, updated_at) "
+            f"VALUES ({sql_literal(title_id)}, {sql_literal(studio_ids[str(title['studio_slug'])])}, {sql_literal(title_slug)}, {sql_literal(str(title['content_kind']))}, {sql_literal(str(title['lifecycle_status']))}, {sql_literal(str(title['visibility']))}, NULL, NULL, {sql_literal(now)}, {sql_literal(now)});"
+        )
+
+        revision_count = 2 if int(title["title_index"]) % 3 == 0 else 1
+        metadata_revision_ids: list[str] = []
+        for revision in range(1, revision_count + 1):
+            metadata_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/title-metadata/{title_slug}/{revision}"))
+            metadata_revision_ids.append(metadata_id)
+            short_description = str(title["short_description"]) if revision == revision_count else f"{title['short_description']} Earlier revision."
+            description = str(title["description"]) if revision == revision_count else f"{title['description']} This earlier revision preserves historical copy."
+            is_frozen = revision < revision_count or str(title["lifecycle_status"]) != "draft"
+            sql_lines.append(
+                "INSERT INTO title_metadata_versions (id, title_id, revision_number, display_name, short_description, description, genre_display, min_players, max_players, age_rating_authority, age_rating_value, min_age_years, is_frozen, created_at, updated_at) "
+                f"VALUES ({sql_literal(metadata_id)}, {sql_literal(title_id)}, {revision}, {sql_literal(str(title['display_name']))}, {sql_literal(short_description)}, {sql_literal(description)}, {sql_literal(str(title['genre_display']))}, {int(title['min_players'])}, {int(title['max_players'])}, {sql_literal(str(title['age_rating_authority']))}, {sql_literal(str(title['age_rating_value']))}, {int(title['min_age_years'])}, {sql_literal(is_frozen)}, {sql_literal(now)}, {sql_literal(now)});"
+            )
+
+        current_metadata_id = metadata_revision_ids[-1]
+        title_current_metadata_ids[title_slug] = current_metadata_id
+
+        release_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/title-releases/{title_slug}/current"))
+        lifecycle_status = str(title["lifecycle_status"])
+        release_status = "draft" if lifecycle_status == "draft" else "published"
+        published_at = None if release_status == "draft" else now
+        sql_lines.append(
+            "INSERT INTO title_releases (id, title_id, metadata_version_id, version, status, published_at, created_at, updated_at) "
+            f"VALUES ({sql_literal(release_id)}, {sql_literal(title_id)}, {sql_literal(current_metadata_id)}, {sql_literal('0.1.0' if release_status == 'draft' else '1.0.0')}, {sql_literal(release_status)}, {sql_literal(published_at)}, {sql_literal(now)}, {sql_literal(now)});"
+        )
+
+        if release_status == "published":
+            title_current_release_ids[title_slug] = release_id
+            artifact_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/release-artifacts/{title_slug}/apk"))
+            package_suffix = title_slug.replace("-", "")
+            sql_lines.append(
+                "INSERT INTO release_artifacts (id, release_id, artifact_kind, package_name, version_code, sha256, file_size_bytes, created_at, updated_at) "
+                f"VALUES ({sql_literal(artifact_id)}, {sql_literal(release_id)}, 'apk', {sql_literal(f'fun.board.{package_suffix}')}, {100 + int(title['title_index'])}, {sql_literal(hashlib.sha256(title_slug.encode('utf-8')).hexdigest())}, {sql_literal(96000000 + int(title['title_index']) * 25000)}, {sql_literal(now)}, {sql_literal(now)});"
+            )
+        else:
+            title_current_release_ids[title_slug] = None
+
+    for title in titles:
+        title_slug = str(title["slug"])
+        title_id = title_ids[title_slug]
+        sql_lines.append(
+            "UPDATE titles SET "
+            f"current_metadata_version_id = {sql_literal(title_current_metadata_ids[title_slug])}, "
+            f"current_release_id = {sql_literal(title_current_release_ids[title_slug])}, "
+            f"updated_at = {sql_literal(now)} "
+            f"WHERE id = {sql_literal(title_id)};"
+        )
+
+        assigned_media_roles: set[str] = set(title["media_assignments"])
+        for media_role, (width, height) in {
+            "card": (900, 1280),
+            "hero": (1600, 900),
+            "logo": (1200, 400),
+        }.items():
+            if media_role not in assigned_media_roles:
+                continue
+            media_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/title-media/{title_slug}/{media_role}"))
+            media_url = f"https://localhost:7277/test-images/seed-catalog/{title_slug}/{media_role}.png"
+            sql_lines.append(
+                "INSERT INTO title_media_assets (id, title_id, media_role, source_url, alt_text, mime_type, width, height, created_at, updated_at) "
+                f"VALUES ({sql_literal(media_id)}, {sql_literal(title_id)}, {sql_literal(media_role)}, {sql_literal(media_url)}, {sql_literal(str(title['display_name']) + ' ' + media_role + ' art')}, 'image/png', {width}, {height}, {sql_literal(now)}, {sql_literal(now)});"
+            )
+
+    integration_connection_ids: dict[str, str] = {}
+    supported_publisher_ids = [
+        "44444444-4444-4444-4444-444444444444",
+        "55555555-5555-5555-5555-555555555555",
+        "12121212-1212-1212-1212-121212121212",
+    ]
+    for studio_index, studio in enumerate(studios):
+        connection_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/integration-connections/{studio.slug}"))
+        integration_connection_ids[studio.slug] = connection_id
+        if studio_index % 4 == 3:
+            custom_name = f"{studio.display_name} Direct"
+            custom_url = f"https://{studio.slug}.example.com"
+            sql_lines.append(
+                "INSERT INTO integration_connections (id, studio_id, supported_publisher_id, custom_publisher_display_name, custom_publisher_homepage_url, config_json, is_enabled, created_at, updated_at) "
+                f"VALUES ({sql_literal(connection_id)}, {sql_literal(studio_ids[studio.slug])}, NULL, {sql_literal(custom_name)}, {sql_literal(custom_url)}, {sql_jsonb({'connectionMode': 'direct', 'sandbox': True})}, TRUE, {sql_literal(now)}, {sql_literal(now)});"
+            )
+        else:
+            publisher_id = supported_publisher_ids[studio_index % len(supported_publisher_ids)]
+            sql_lines.append(
+                "INSERT INTO integration_connections (id, studio_id, supported_publisher_id, custom_publisher_display_name, custom_publisher_homepage_url, config_json, is_enabled, created_at, updated_at) "
+                f"VALUES ({sql_literal(connection_id)}, {sql_literal(studio_ids[studio.slug])}, {sql_literal(publisher_id)}, NULL, NULL, {sql_jsonb({'sandbox': True, 'channel': 'local-seed'})}, TRUE, {sql_literal(now)}, {sql_literal(now)});"
+            )
+
+    for title in titles:
+        title_index = int(title["title_index"])
+        if title_index % 5 == 0:
+            continue
+
+        title_slug = str(title["slug"])
+        studio_slug = str(title["studio_slug"])
+        binding_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/title-bindings/{title_slug}"))
+        acquisition_url = f"https://{studio_slug}.example.com/titles/{title_slug}"
+        sql_lines.append(
+            "INSERT INTO title_integration_bindings (id, title_id, integration_connection_id, acquisition_url, acquisition_label, config_json, is_primary, is_enabled, created_at, updated_at) "
+            f"VALUES ({sql_literal(binding_id)}, {sql_literal(title_ids[title_slug])}, {sql_literal(integration_connection_ids[studio_slug])}, {sql_literal(acquisition_url)}, {sql_literal('Open publisher page')}, {sql_jsonb({'seeded': True})}, TRUE, TRUE, {sql_literal(now)}, {sql_literal(now)});"
+        )
+
+    sql_lines.append("COMMIT;")
+    return "\n".join(sql_lines)
+
+
+def sql_literal(value: Any) -> str:
+    """Render a Python value as a SQL literal for seed scripts.
+
+    Args:
+        value: Python value.
+
+    Returns:
+        SQL literal string.
+    """
+
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, datetime):
+        normalized = value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        return f"'{normalized}'::timestamptz"
+
+    escaped = str(value).replace("'", "''")
+    return f"'{escaped}'"
+
+
+def sql_jsonb(value: dict[str, Any] | None) -> str:
+    """Render JSON payload for ``jsonb`` SQL columns.
+
+    Args:
+        value: JSON-serializable dictionary.
+
+    Returns:
+        SQL expression for ``jsonb``.
+    """
+
+    if value is None:
+        return "NULL"
+    return f"{sql_literal(json.dumps(value, separators=(',', ':'), sort_keys=True))}::jsonb"
+
+
+def execute_postgres_sql(config: DevConfig, sql_script: str) -> None:
+    """Execute SQL against local PostgreSQL container.
+
+    Args:
+        config: CLI configuration.
+        sql_script: SQL script text.
+
+    Returns:
+        None.
+
+    Raises:
+        DevCliError: If command execution fails.
+    """
+
+    cmd = [
+        "docker",
+        "exec",
+        "-i",
+        config.postgres_container_name,
+        "psql",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-U",
+        config.postgres_user,
+        "-d",
+        config.postgres_database,
+    ]
+
+    result = subprocess.run(
+        cmd,
+        input=sql_script.encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr_text = (result.stderr or b"").decode(errors="replace").strip()
+        raise DevCliError(
+            f"Seed SQL execution failed ({result.returncode}): {quote_cmd(cmd)}"
+            + (f"\n{stderr_text}" if stderr_text else "")
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the CLI parser with typed subcommands and shared options.
 
@@ -3078,6 +4706,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     restore.add_argument("input", type=Path, help="Path to a .sql backup file created by db-backup")
 
+    seed_data = subparsers.add_parser(
+        "seed-data",
+        parents=[shared],
+        help="Populate deterministic local Keycloak + PostgreSQL sample data for UI/UX testing",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    seed_data.add_argument(
+        "--reset-media",
+        action="store_true",
+        help="Delete the legacy generated-media cache before validating static seed assets",
+    )
+    seed_data.add_argument(
+        "--seed-password",
+        default=LOCAL_SEED_DEFAULT_PASSWORD,
+        help="Password assigned to seeded local Keycloak users",
+    )
+
     return parser
 
 
@@ -3237,6 +4882,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             db_backup(config, output_path=args.output)
         elif args.command == "db-restore":
             db_restore(config, input_path=args.input)
+        elif args.command == "seed-data":
+            seed_local_data(
+                config,
+                reset_media=args.reset_media,
+                seed_password=args.seed_password,
+            )
         else:
             parser.error(f"Unknown command: {args.command}")
     except KeyboardInterrupt:
