@@ -11,7 +11,7 @@
 
 ## Purpose
 
-This document records the currently aligned architecture and delivery plan after Wave 6 access-role realignment implementation.
+This document records the currently aligned architecture and delivery plan after Wave 7 workspace-shell and catalog realignment implementation.
 
 It exists to make one distinction explicit:
 
@@ -39,14 +39,14 @@ The project remains aligned to these decisions:
 
 ## Current Implemented State
 
-As of March 5, 2026, the maintained implemented surface is:
+As of March 7, 2026, the maintained implemented surface is:
 
 - health endpoints: `/`, `/health/live`, `/health/ready`
-- Keycloak-backed identity endpoints: `/identity/roles`, `/identity/auth/config`, `/identity/auth/login`, `/identity/auth/callback`, `/identity/me`, `GET|POST /identity/me/developer-enrollment`, and `GET|PUT|DELETE /identity/me/board-profile`
+- Keycloak-backed identity endpoints: `/identity/roles`, `/identity/auth/config`, `/identity/auth/login`, `/identity/auth/callback`, `/identity/me`, `GET|PUT /identity/me/profile`, `PUT /identity/me/profile/avatar-url`, `POST /identity/me/profile/avatar-upload`, `DELETE /identity/me/profile/avatar`, `GET|POST /identity/me/developer-enrollment`, and `GET|PUT|DELETE /identity/me/board-profile`
 - moderation endpoints: `GET /moderation/developers`, `GET /moderation/developers/{developerIdentifier}/verification`, and `PUT|DELETE /moderation/developers/{developerSubject}/verified-developer`
-- studio endpoints: public `GET /studios`, public `GET /studios/{slug}`, authenticated `POST|PUT|DELETE /studios...`, and authenticated membership management endpoints
+- studio endpoints: public `GET /studios`, public `GET /studios/{slug}`, authenticated `POST|PUT|DELETE /studios...`, authenticated membership management endpoints, authenticated studio link CRUD endpoints, and authenticated studio logo/banner upload endpoints
 - catalog endpoints: public `GET /catalog`, public `GET /catalog/{studioSlug}/{titleSlug}`, authenticated title/metadata management endpoints, authenticated media/release/artifact management endpoints, public `GET /supported-publishers`, and authenticated connection/acquisition-binding management endpoints
-- EF Core persistence with migrations for `users`, `user_board_profiles`, `studios`, `studio_memberships`, `titles`, `title_metadata_versions`, `title_media_assets`, `title_releases`, `release_artifacts`, `supported_publishers`, `integration_connections`, and `title_integration_bindings`
+- EF Core persistence with migrations for `users`, `user_board_profiles`, `studios`, `studio_memberships`, `studio_links`, `titles`, `title_metadata_versions`, `title_media_assets`, `title_releases`, `release_artifacts`, `supported_publishers`, `integration_connections`, and `title_integration_bindings`
 - Postman mock-first contract assets for the above endpoints
 - backend endpoint unit tests plus Postgres-backed integration coverage for persistence and constraints
 - developer automation for local bootstrap, Docker dependencies, and test execution
@@ -64,7 +64,7 @@ Because those later items are not implemented, they should not remain in the mai
 
 ## Wave Realignment
 
-To avoid contract drift, the project should treat the current backend as a completed foundation plus Waves 1 through 6 baseline and start the next schema work from the Wave 7 boundary.
+To avoid contract drift, the project should treat the current backend as a completed foundation plus Waves 1 through 7 baseline and start the next schema work from the Wave 8 boundary.
 
 ### Foundation (implemented)
 
@@ -110,11 +110,13 @@ Implemented Wave 6 behavior includes:
 - developer-access checks that tolerate stale bearer role claims by rechecking Keycloak
 - removal of deprecated enrollment workflow persistence and API/UI surfaces (request queues, workflow conversations/attachments, and in-app notifications)
 
-### Wave 7 (in progress)
+### Wave 7 (implemented)
 
-Developer and moderation workflow-shell realignment.
+Status: implemented on March 7, 2026.
 
-Wave 7 behavior being delivered includes:
+Developer, moderation, player, and public-catalog workflow-shell realignment.
+
+Implemented Wave 7 behavior includes:
 
 - keep `/develop` as a shared player/developer entry where players can self-enable developer access
 - show minimal onboarding UX on `/develop` for player-only accounts
@@ -124,6 +126,11 @@ Wave 7 behavior being delivered includes:
 - mirror the same workflow-shell pattern between `/develop` and `/moderate` for consistent navigation
 - wire moderation workspace to user-directory + verification-state APIs with fuzzy account selection and a single verified toggle workflow
 - normalize workspace shell layout behavior across `/player`, `/develop`, and `/moderate`
+- remove obsolete standalone `/develop/studios/...` pages once their create/overview/settings behavior is superseded by the in-place `/develop` studio workflows
+- add deterministic Wave 7 seed data for auth/catalog/workspace validation through `python ./scripts/dev.py seed-data`
+- extend studio management with public link CRUD plus studio logo/banner upload and URL support
+- render studio branding and studio links on public studio pages, including icon affordances for common social hosts
+- align `/browse` and `/studios/{studio-slug}` around the same live client-side search/filter/results interaction model
 
 ### Wave 8 (planned)
 

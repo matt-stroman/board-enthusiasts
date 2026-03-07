@@ -26,10 +26,12 @@ import argparse
 import hashlib
 import http.client
 import json
+import math
 import os
 import shlex
 import shutil
 import signal
+import socket
 import ssl
 import struct
 import subprocess
@@ -267,6 +269,8 @@ def run_command(
         check=False,
         capture_output=capture_output,
         text=text,
+        encoding="utf-8" if text else None,
+        errors="replace" if text else None,
         stdin=stdin,
         stdout=stdout,
         stderr=stderr,
@@ -521,6 +525,187 @@ def wait_for_http_ready(*, url: str, description: str, timeout_seconds: int = 90
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         reachable, detail = probe_http_url(url)
+        if reachable:
+            print(f"{description} is ready.")
+            return
+        time.sleep(2)
+
+    raise DevCliError(f"Timed out waiting for {description} readiness at {url}.")
+
+
+def get_url_host_port(url: str) -> tuple[str, int]:
+    """Resolve the host and port for a URL.
+
+    Args:
+        url: URL to inspect.
+
+    Returns:
+        Tuple of ``(host, port)``.
+
+    Raises:
+        DevCliError: If the URL omits a host or uses an unsupported scheme.
+    """
+
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").strip()
+    if not host:
+        raise DevCliError(f"URL does not include a host: {url}")
+
+    if parsed.port is not None:
+        return host, parsed.port
+
+    scheme = parsed.scheme.lower()
+    if scheme == "https":
+        return host, 443
+    if scheme == "http":
+        return host, 80
+
+    raise DevCliError(f"Unsupported URL scheme '{parsed.scheme}' for local port inspection: {url}")
+
+
+def can_connect_to_tcp_port(*, host: str, port: int, timeout_seconds: float = 0.5) -> bool:
+    """Return whether a TCP listener accepts connections at the host and port.
+
+    Args:
+        host: Host name or IP address to probe.
+        port: TCP port to probe.
+        timeout_seconds: Socket connect timeout.
+
+    Returns:
+        ``True`` when a listener accepts the connection, else ``False``.
+    """
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout_seconds):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_local_url_port_available(*, url: str, description: str) -> None:
+    """Ensure a local URL target port is not already occupied.
+
+    Args:
+        url: Local URL to inspect.
+        description: Human-readable service description used in the failure message.
+
+    Returns:
+        None.
+
+    Raises:
+        DevCliError: If another local process is already listening on the URL port.
+    """
+
+    if not is_local_http_url(url):
+        return
+
+    host, port = get_url_host_port(url)
+    if not can_connect_to_tcp_port(host=host, port=port):
+        return
+
+    raise DevCliError(
+        f"Cannot start {description}: {url} is already in use by another local process. "
+        f"Stop the existing process bound to port {port}, or reuse that existing instance instead."
+    )
+
+
+def wait_for_background_process_http_ready(
+    *,
+    process: subprocess.Popen,
+    url: str,
+    description: str,
+    log_path: Path | None = None,
+    timeout_seconds: int = 90,
+) -> None:
+    """Wait until a spawned background process serves HTTP successfully.
+
+    Args:
+        process: Spawned background process expected to serve the URL.
+        url: URL to poll for readiness.
+        description: Human-readable service description for log output.
+        log_path: Optional log file written by the background process.
+        timeout_seconds: Maximum time to wait before failing.
+
+    Returns:
+        None.
+
+    Raises:
+        DevCliError: If the process exits before the URL becomes ready or the URL
+            never becomes ready before timeout.
+    """
+
+    write_step(f"Waiting for {description} readiness (up to {timeout_seconds} seconds)")
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if process.poll() is not None:
+            exit_code = process.returncode if process.returncode is not None else "unknown"
+            log_excerpt = ""
+            if log_path is not None and log_path.exists():
+                log_excerpt = log_path.read_text(encoding="utf-8", errors="replace").strip()
+                if len(log_excerpt) > 4000:
+                    log_excerpt = log_excerpt[-4000:]
+
+            message = (
+                f"{description} exited before becoming ready (exit code {exit_code}). "
+                f"Review log: {log_path or 'n/a'}"
+            )
+            if log_excerpt:
+                message = f"{message}\nRecent log output:\n{log_excerpt}"
+            raise DevCliError(message)
+
+        reachable, _detail = probe_http_url(url)
+        if reachable:
+            print(f"{description} is ready.")
+            return
+        time.sleep(2)
+
+    raise DevCliError(f"Timed out waiting for {description} readiness at {url}.")
+
+
+def wait_for_container_http_ready(
+    *,
+    url: str,
+    description: str,
+    container_name: str,
+    timeout_seconds: int = 90,
+) -> None:
+    """Wait until an HTTP endpoint is ready while also validating container health.
+
+    Args:
+        url: URL to poll for readiness.
+        description: Human-readable service description for log output.
+        container_name: Docker container name backing the service.
+        timeout_seconds: Maximum time to wait before failing.
+
+    Returns:
+        None.
+
+    Raises:
+        DevCliError: If the service container crash-loops, exits, disappears, or the
+            endpoint does not return success before timeout.
+    """
+
+    write_step(f"Waiting for {description} readiness (up to {timeout_seconds} seconds)")
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        container_state = get_docker_container_state(container_name)
+        if container_state in {"restarting", "exited", "dead"}:
+            logs_result = run_command(
+                ["docker", "logs", "--tail", "80", container_name],
+                check=False,
+                capture_output=True,
+            )
+            logs = (logs_result.stdout or logs_result.stderr or "").strip()
+            detail = f"Container '{container_name}' is in state '{container_state}'."
+            if logs:
+                detail = f"{detail}\nRecent logs:\n{logs}"
+
+            raise DevCliError(detail)
+
+        if container_state is None:
+            raise DevCliError(f"Container '{container_name}' was not found while waiting for {description} readiness.")
+
+        reachable, _detail = probe_http_url(url)
         if reachable:
             print(f"{description} is ready.")
             return
@@ -899,6 +1084,7 @@ def start_backend_api_process(config: DevConfig) -> tuple[subprocess.Popen, Path
     project_path = config.repo_root / config.backend_project
     if not project_path.exists():
         raise DevCliError(f"Backend project not found: {project_path}")
+    ensure_local_url_port_available(url=config.backend_base_url, description="backend API")
 
     logs_dir = config.repo_root / ".dev-cli-logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -1284,9 +1470,10 @@ def start_dependencies(config: DevConfig, *, include_keycloak: bool = True) -> N
             write_step("Starting Keycloak via docker compose")
             invoke_docker_compose(config, ["up", "-d", "keycloak"])
 
-        wait_for_http_ready(
+        wait_for_container_http_ready(
             url=config.keycloak_ready_url,
             description="Keycloak",
+            container_name=config.keycloak_container_name,
             timeout_seconds=KEYCLOAK_READY_TIMEOUT_SECONDS,
         )
 
@@ -1423,6 +1610,7 @@ def run_backend_api(config: DevConfig, *, do_restore: bool) -> None:
     project_path = config.repo_root / config.backend_project
     if not project_path.exists():
         raise DevCliError(f"Backend project not found: {project_path}")
+    ensure_local_url_port_available(url=config.backend_base_url, description="backend API")
 
     if do_restore:
         write_step("Restoring backend project")
@@ -1631,6 +1819,9 @@ def run_full_local_web_stack(
     css_watch_log_path: Path | None = None
 
     try:
+        ensure_local_url_port_available(url=backend_url, description="backend API")
+        ensure_local_url_port_available(url=frontend_url, description="frontend web UI")
+
         write_step("Starting backend API in the background")
         backend_process, backend_log_path = start_background_command_with_log(
             cmd=["dotnet", "run", "--project", str(config.repo_root / config.backend_project), "--no-restore", "--no-launch-profile"],
@@ -1645,7 +1836,12 @@ def run_full_local_web_stack(
             config=config,
         )
         print(f"Backend log: {backend_log_path}")
-        wait_for_http_ready(url=f"{backend_url.rstrip('/')}/health/live", description="Backend API")
+        wait_for_background_process_http_ready(
+            process=backend_process,
+            url=f"{backend_url.rstrip('/')}/health/live",
+            description="Backend API",
+            log_path=backend_log_path,
+        )
 
         keycloak_ready, keycloak_detail = probe_http_url(config.keycloak_ready_url)
         if not keycloak_ready:
@@ -1671,7 +1867,12 @@ def run_full_local_web_stack(
             hot_reload=hot_reload,
         )
         print(f"Frontend log: {frontend_log_path}")
-        wait_for_http_ready(url=frontend_url, description="Frontend web UI")
+        wait_for_background_process_http_ready(
+            process=frontend_process,
+            url=frontend_url,
+            description="Frontend web UI",
+            log_path=frontend_log_path,
+        )
 
         state: dict[str, object] = {
             "started_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -1723,7 +1924,12 @@ def run_full_local_web_stack(
                         hot_reload=hot_reload,
                     )
                     print(f"Frontend log: {frontend_log_path}")
-                    wait_for_http_ready(url=frontend_url, description="Frontend web UI")
+                    wait_for_background_process_http_ready(
+                        process=frontend_process,
+                        url=frontend_url,
+                        description="Frontend web UI",
+                        log_path=frontend_log_path,
+                    )
 
                     state["frontend"] = {
                         "pid": frontend_process.pid,
@@ -1935,6 +2141,7 @@ def start_frontend_web_process_with_log(
     project_path = config.repo_root / config.frontend_web_project
     if not project_path.exists():
         raise DevCliError(f"Frontend web project not found: {project_path}")
+    ensure_local_url_port_available(url=frontend_url, description="frontend web UI")
 
     return start_background_command_with_log(
         cmd=get_frontend_web_launch_command(project_path, hot_reload=hot_reload),
@@ -2231,7 +2438,13 @@ def run_api_contract_tests(
         write_step("Starting backend API in the background for contract tests")
         backend_process, backend_log_path = start_backend_api_process(config)
         try:
-            wait_for_http_ready(url=base_url, description="backend API", timeout_seconds=60)
+            wait_for_background_process_http_ready(
+                process=backend_process,
+                url=base_url,
+                description="backend API",
+                log_path=backend_log_path,
+                timeout_seconds=60,
+            )
         except DevCliError as ex:
             stop_background_process(backend_process)
             log_excerpt = ""
@@ -2715,7 +2928,8 @@ LOCAL_KEYCLOAK_ADMIN_USERNAME = "admin"
 LOCAL_KEYCLOAK_ADMIN_PASSWORD = "admin"
 LOCAL_KEYCLOAK_DEFAULT_REALM = "board-third-party-library"
 LOCAL_SEED_DEFAULT_PASSWORD = "ChangeMe!123"
-LOCAL_SEED_IMAGE_BASE_PATH = Path("frontend/src/Board.ThirdPartyLibrary.Frontend.Web/wwwroot/test-images/generated")
+LOCAL_SEED_IMAGE_BASE_PATH = Path("frontend/src/Board.ThirdPartyLibrary.Frontend.Web/wwwroot/test-images/seed-catalog")
+LEGACY_LOCAL_SEED_GENERATED_IMAGE_PATH = Path("frontend/src/Board.ThirdPartyLibrary.Frontend.Web/wwwroot/test-images/generated")
 
 
 @dataclass(frozen=True)
@@ -2744,6 +2958,7 @@ class LocalSeedStudio:
     display_name: str
     description: str
     owner_username: str
+    links: tuple[tuple[str, str], ...]
 
 
 def seed_local_data(config: DevConfig, *, reset_media: bool, seed_password: str) -> None:
@@ -2751,7 +2966,7 @@ def seed_local_data(config: DevConfig, *, reset_media: bool, seed_password: str)
 
     Args:
         config: CLI configuration for local containers and paths.
-        reset_media: Whether to clear generated test images before regenerating.
+        reset_media: Whether to clear the obsolete generated-media cache after validating static assets.
         seed_password: Password assigned to seeded local Keycloak users.
 
     Returns:
@@ -2815,11 +3030,20 @@ def seed_local_data(config: DevConfig, *, reset_media: bool, seed_password: str)
         )
         seeded_user_subjects[user.username] = user_subject
 
-    write_step("Generating local catalog media assets")
+    write_step("Validating checked-in catalog media assets")
     studios = build_local_seed_studios()
     titles = build_local_seed_titles(studios)
     media_root = (config.repo_root / LOCAL_SEED_IMAGE_BASE_PATH).resolve()
-    generate_local_seed_media_assets(titles=titles, media_root=media_root, reset_media=reset_media)
+    validate_local_seed_media_assets(
+        titles=titles,
+        studios=studios,
+        media_root=media_root,
+        reset_media=reset_media,
+        config=config,
+    )
+
+    write_step("Applying backend database migrations")
+    apply_backend_database_migrations(config)
 
     write_step("Populating PostgreSQL seed data")
     sql_script = build_local_seed_sql_script(
@@ -2827,12 +3051,13 @@ def seed_local_data(config: DevConfig, *, reset_media: bool, seed_password: str)
         user_subjects=seeded_user_subjects,
         studios=studios,
         titles=titles,
+        media_root=media_root,
     )
     execute_postgres_sql(config, sql_script)
 
     print("Local seed data is ready.")
     print("Seed users use password:", seed_password)
-    print("Generated media root:", media_root)
+    print("Static media root:", media_root)
 
 
 def ensure_keycloak_running_for_seed(config: DevConfig) -> None:
@@ -2859,6 +3084,33 @@ def ensure_keycloak_running_for_seed(config: DevConfig) -> None:
         url=config.keycloak_ready_url,
         description="Keycloak",
         timeout_seconds=KEYCLOAK_READY_TIMEOUT_SECONDS,
+    )
+
+
+def apply_backend_database_migrations(config: DevConfig) -> None:
+    """Apply backend EF Core migrations before local seed operations.
+
+    Args:
+        config: CLI configuration containing the backend project path.
+
+    Returns:
+        None.
+    """
+
+    backend_project = config.repo_root / config.backend_project
+    run_command(
+        [
+            "dotnet",
+            "ef",
+            "database",
+            "update",
+            "--project",
+            str(backend_project),
+            "--startup-project",
+            str(backend_project),
+            "--no-build",
+        ],
+        cwd=config.repo_root,
     )
 
 
@@ -3236,15 +3488,96 @@ def build_local_seed_studios() -> list[LocalSeedStudio]:
     """
 
     return [
-        LocalSeedStudio("blue-harbor-games", "Blue Harbor Games", "Co-op adventures with bright maritime themes and approachable controls.", "emma.torres"),
-        LocalSeedStudio("pine-lantern-labs", "Pine Lantern Labs", "Narrative puzzle team focused on campfire mystery and family play.", "emma.torres"),
-        LocalSeedStudio("quartz-rabbit-studio", "Quartz Rabbit Studio", "Fast-action arcade experiments with local and online score races.", "liam.chen"),
-        LocalSeedStudio("north-maple-interactive", "North Maple Interactive", "Strategic board-inspired designs for quick sessions and tournaments.", "noah.walters"),
-        LocalSeedStudio("copper-finch-works", "Copper Finch Works", "Whimsical creature sims and cozy exploration for all ages.", "maya.singh"),
-        LocalSeedStudio("lumen-cartography", "Lumen Cartography", "Tooling-led studio building companion apps and interactive map systems.", "olivia.bennett"),
-        LocalSeedStudio("tiny-orbit-forge", "Tiny Orbit Forge", "Sci-fi builders featuring modular crafting and community challenges.", "ethan.foster"),
-        LocalSeedStudio("moss-byte-collective", "Moss Byte Collective", "Experimental co-op projects mixing rhythm, puzzle, and narrative beats.", "amelia.park"),
-        LocalSeedStudio("harborlight-mechanics", "Harborlight Mechanics", "Competitive strategy and logistics play tuned for weekend sessions.", "lucas.hughes"),
+        LocalSeedStudio(
+            "blue-harbor-games",
+            "Blue Harbor Games",
+            "Co-op adventures with bright maritime themes and approachable controls.",
+            "emma.torres",
+            (
+                ("Discord", "https://discord.gg/blueharborgames"),
+                ("YouTube", "https://www.youtube.com/@BlueHarborGames"),
+                ("Press Kit", "https://blueharborgames.example/press"),
+            )),
+        LocalSeedStudio(
+            "pine-lantern-labs",
+            "Pine Lantern Labs",
+            "Narrative puzzle team focused on campfire mystery and family play.",
+            "emma.torres",
+            (
+                ("Instagram", "https://www.instagram.com/pinelanternlabs"),
+                ("Discord", "https://discord.gg/pinelanternlabs"),
+                ("Community Wiki", "https://pinelanternlabs.example/wiki"),
+            )),
+        LocalSeedStudio(
+            "quartz-rabbit-studio",
+            "Quartz Rabbit Studio",
+            "Fast-action arcade experiments with local and online score races.",
+            "liam.chen",
+            (
+                ("X", "https://x.com/quartzrabbit"),
+                ("TikTok", "https://www.tiktok.com/@quartzrabbit"),
+                ("Support", "https://quartzrabbit.example/support"),
+            )),
+        LocalSeedStudio(
+            "north-maple-interactive",
+            "North Maple Interactive",
+            "Strategic board-inspired designs for quick sessions and tournaments.",
+            "noah.walters",
+            (
+                ("LinkedIn", "https://www.linkedin.com/company/north-maple-interactive"),
+                ("Facebook", "https://www.facebook.com/northmapleinteractive"),
+                ("Storefront", "https://northmaple.example/store"),
+            )),
+        LocalSeedStudio(
+            "copper-finch-works",
+            "Copper Finch Works",
+            "Whimsical creature sims and cozy exploration for all ages.",
+            "maya.singh",
+            (
+                ("Instagram", "https://www.instagram.com/copperfinchworks"),
+                ("Discord", "https://discord.gg/copperfinchworks"),
+                ("Newsletter", "https://copperfinch.example/newsletter"),
+            )),
+        LocalSeedStudio(
+            "lumen-cartography",
+            "Lumen Cartography",
+            "Tooling-led studio building companion apps and interactive map systems.",
+            "olivia.bennett",
+            (
+                ("GitHub", "https://github.com/lumen-cartography"),
+                ("LinkedIn", "https://www.linkedin.com/company/lumen-cartography"),
+                ("Docs", "https://lumen-cartography.example/docs"),
+            )),
+        LocalSeedStudio(
+            "tiny-orbit-forge",
+            "Tiny Orbit Forge",
+            "Sci-fi builders featuring modular crafting and community challenges.",
+            "ethan.foster",
+            (
+                ("YouTube", "https://www.youtube.com/@TinyOrbitForge"),
+                ("Discord", "https://discord.gg/tinyorbitforge"),
+                ("Creator Blog", "https://tinyorbitforge.example/blog"),
+            )),
+        LocalSeedStudio(
+            "moss-byte-collective",
+            "Moss Byte Collective",
+            "Experimental co-op projects mixing rhythm, puzzle, and narrative beats.",
+            "amelia.park",
+            (
+                ("X", "https://x.com/mossbytecollective"),
+                ("Discord", "https://discord.gg/mossbytecollective"),
+                ("Bandcamp", "https://mossbytecollective.example/soundtrack"),
+            )),
+        LocalSeedStudio(
+            "harborlight-mechanics",
+            "Harborlight Mechanics",
+            "Competitive strategy and logistics play tuned for weekend sessions.",
+            "lucas.hughes",
+            (
+                ("Facebook", "https://www.facebook.com/harborlightmechanics"),
+                ("YouTube", "https://www.youtube.com/@HarborlightMechanics"),
+                ("Tournament Hub", "https://harborlight.example/tournaments"),
+            )),
     ]
 
 
@@ -3258,56 +3591,217 @@ def build_local_seed_titles(studios: Sequence[LocalSeedStudio]) -> list[dict[str
         List of title dictionaries ready for media generation and SQL emission.
     """
 
-    genre_sets: list[tuple[str, ...]] = [
-        ("Strategy",),
-        ("Puzzle", "Family"),
-        ("Adventure", "Co-op", "Story Rich"),
-        ("Arcade", "Action", "Party"),
-        ("Simulation", "Building", "Management", "Sandbox"),
-        ("RPG", "Adventure", "Crafting", "Exploration", "Co-op"),
-        ("Rhythm", "Music"),
-        ("Educational", "Trivia", "Family"),
-        ("Productivity",),
-        ("Utility", "Creator Tools", "Automation", "Cloud", "Companion", "Modding"),
-    ]
-    title_nouns = [
-        "Signal Harbor",
-        "Lantern Drift",
-        "Solar Orchard",
-        "Compass Echo",
-        "Circuit Garden",
-        "Nebula Relay",
-        "Stonepath Rally",
-        "Clockwork Crew",
-        "Moonlight Ledger",
-        "Riverlight Quest",
-        "Parade of Sparks",
-        "Anchorpoint Atlas",
-        "Starlane Sprint",
-        "Fjord Frontier",
-        "Patchwork Port",
-        "Nightglass Tactics",
-        "Orbit Orchard",
-        "Marble Meridian",
-        "Signal Syndicate",
-        "Trailblazer Terminal",
-        "Cinderline Workshop",
-        "Mosaic Drift",
-        "Echo Harborline",
-        "Pioneer Broadcast",
-        "Cascade Courier",
-        "Festival Foundry",
-        "Beacon Boardwalk",
-        "Cloudline Studio",
-        "Cobalt Almanac",
-        "Hearthside Protocol",
-    ]
-    short_hooks = [
-        "Team up for short sessions with quick wins.",
-        "Build strategies and adapt to changing rounds.",
-        "Explore handcrafted spaces and unlock hidden routes.",
-        "Compete for high scores with simple controls.",
-        "Coordinate roles and manage shared resources.",
+    title_concepts: list[dict[str, Any]] = [
+        {
+            "display_name": "Signal Harbor",
+            "content_kind": "game",
+            "genre_set": ("Strategy", "Defense"),
+            "short_description": "Command a storm-battered harbor and outmaneuver raiders with clever beacon chains.",
+            "description": "Chain lighthouses, reroute cargo fleets, and trap raiders in a tense coastal strategy game built around shifting tides and line-of-sight control."
+        },
+        {
+            "display_name": "Lantern Drift",
+            "content_kind": "game",
+            "genre_set": ("Puzzle", "Family"),
+            "short_description": "Guide glowing paper boats through a midnight canal festival without snuffing the flame.",
+            "description": "Tilt waterways, spin lock-gates, and weave through fireworks as every lantern casts new puzzle shadows across the river."
+        },
+        {
+            "display_name": "Solar Orchard",
+            "content_kind": "game",
+            "genre_set": ("Simulation", "Building", "Management"),
+            "short_description": "Grow a radiant orchard beneath mirrored suns and keep the colony thriving.",
+            "description": "Balance irrigation drones, fruit mutations, and solar weather inside a lush sci-fi orchard where every harvest reshapes the biome."
+        },
+        {
+            "display_name": "Compass Echo",
+            "content_kind": "app",
+            "genre_set": ("Companion", "Utility", "Exploration"),
+            "short_description": "Plot expedition routes, track secrets, and sync clue boards for sprawling adventures.",
+            "description": "Compass Echo is a premium companion app for campaign nights, with layered maps, route planning, and clue pinning for cooperative exploration games."
+        },
+        {
+            "display_name": "Circuit Garden",
+            "content_kind": "game",
+            "genre_set": ("Sandbox", "Automation", "Puzzle"),
+            "short_description": "Wire a neon greenhouse where every vine, drone, and sprinkler can be automated.",
+            "description": "Create playful machine ecosystems in a glowing bio-lab, solving spatial automation puzzles with modular circuits and responsive plant life."
+        },
+        {
+            "display_name": "Nebula Relay",
+            "content_kind": "game",
+            "genre_set": ("Adventure", "Co-op", "Sci-Fi"),
+            "short_description": "Sprint cargo through collapsing star gates before the relay burns out.",
+            "description": "Pilot courier crews through shattered nebula highways, hopping between stations, hazard fields, and gravity storms in fast cooperative runs."
+        },
+        {
+            "display_name": "Stonepath Rally",
+            "content_kind": "game",
+            "genre_set": ("Arcade", "Racing", "Action"),
+            "short_description": "Drift armored buggies across cliffside roads carved through ancient stone.",
+            "description": "Boost through canyon switchbacks, dodge rockslides, and slam through shortcuts in a rally game built for split-second decisions and dusty spectacle."
+        },
+        {
+            "display_name": "Clockwork Crew",
+            "content_kind": "game",
+            "genre_set": ("Co-op", "Crafting", "Family"),
+            "short_description": "Run a runaway toy workshop with tiny engineers and too many gears.",
+            "description": "Coordinate a charming crew of wind-up workers, assemble contraptions, and keep the shop from shaking itself apart during chaotic co-op shifts."
+        },
+        {
+            "display_name": "Moonlight Ledger",
+            "content_kind": "game",
+            "genre_set": ("Simulation", "Story Rich", "Mystery"),
+            "short_description": "Balance a hidden city's books by candlelight while unraveling its secrets.",
+            "description": "Sort ledgers, decode midnight transactions, and decide who to trust in a moody narrative sim set inside a city that only appears after dusk."
+        },
+        {
+            "display_name": "Riverlight Quest",
+            "content_kind": "game",
+            "genre_set": ("Adventure", "Co-op", "Story Rich"),
+            "short_description": "Follow luminous river spirits through canyons, ruins, and forgotten gardens.",
+            "description": "Traverse painterly wilderness, solve shrine puzzles, and escort river spirits toward a vanished capital in a warm cooperative adventure."
+        },
+        {
+            "display_name": "Parade of Sparks",
+            "content_kind": "game",
+            "genre_set": ("Rhythm", "Music", "Party"),
+            "short_description": "Lead a firework parade where every beat launches a new burst across the sky.",
+            "description": "Drum, dance, and trigger synchronized pyrotechnics across crowded streets in a celebratory rhythm game tuned for loud local sessions."
+        },
+        {
+            "display_name": "Anchorpoint Atlas",
+            "content_kind": "game",
+            "genre_set": ("Adventure", "Puzzle", "Travel"),
+            "short_description": "Globe-hop through glamorous seaside cities in search of a vanished mapmaker.",
+            "description": "Crack location-based riddles, uncover mid-century landmarks, and chase a stylish conspiracy from boardwalks to cliffside villas."
+        },
+        {
+            "display_name": "Starlane Sprint",
+            "content_kind": "game",
+            "genre_set": ("Arcade", "Racing", "Sci-Fi"),
+            "short_description": "Rocket through neon skyways above a city that never powers down.",
+            "description": "Master anti-grav corners, thread through transit lanes, and blaze past holographic billboards in a velocity-first arcade racer."
+        },
+        {
+            "display_name": "Fjord Frontier",
+            "content_kind": "game",
+            "genre_set": ("RPG", "Adventure", "Exploration"),
+            "short_description": "Chart frozen fjords, scale ruined watchtowers, and survive the northern dark.",
+            "description": "Forge camp routes, battle whiteout storms, and uncover relics beneath glacial cliffs in a cinematic expedition RPG."
+        },
+        {
+            "display_name": "Patchwork Port",
+            "content_kind": "game",
+            "genre_set": ("Building", "Management", "Cozy"),
+            "short_description": "Rebuild a sun-faded harbor town one stitched-together district at a time.",
+            "description": "Lay colorful neighborhoods, restore market squares, and welcome quirky residents to a relaxing harbor builder with handcrafted charm."
+        },
+        {
+            "display_name": "Nightglass Tactics",
+            "content_kind": "game",
+            "genre_set": ("Strategy", "Tactics", "Noir"),
+            "short_description": "Stage precision heists across skyscrapers made of mirrored black glass.",
+            "description": "Move operatives through rain-soaked rooftops, control sightlines, and turn reflections into weapons in a sharp neo-noir tactics game."
+        },
+        {
+            "display_name": "Orbit Orchard",
+            "content_kind": "game",
+            "genre_set": ("Simulation", "Sandbox", "Sci-Fi"),
+            "short_description": "Cultivate fruit rings around a tiny planet in zero gravity.",
+            "description": "Build spinning orchards, redirect sunlight, and juggle floating harvest bots in a bright orbital farming sandbox."
+        },
+        {
+            "display_name": "Marble Meridian",
+            "content_kind": "game",
+            "genre_set": ("Puzzle", "Abstract", "Family"),
+            "short_description": "Roll glass marbles through impossible sculpture gardens of color and light.",
+            "description": "Solve elegant momentum puzzles across abstract monuments, mirrored tracks, and gravity-bending marble courses."
+        },
+        {
+            "display_name": "Signal Syndicate",
+            "content_kind": "game",
+            "genre_set": ("Action", "Adventure", "Cyberpunk"),
+            "short_description": "Hijack the city feed and expose a corporate blackout one rooftop at a time.",
+            "description": "Dash through neon high-rises, breach surveillance grids, and evade drone swarms in a fast cyberpunk infiltration campaign."
+        },
+        {
+            "display_name": "Trailblazer Terminal",
+            "content_kind": "app",
+            "genre_set": ("Utility", "Companion", "Productivity"),
+            "short_description": "Plan routes, save checkpoints, and coordinate travel for long-form campaign play.",
+            "description": "Trailblazer Terminal is a route-planning and session-ops app for campaigns that span dozens of locations, side objectives, and shared inventories."
+        },
+        {
+            "display_name": "Cinderline Workshop",
+            "content_kind": "game",
+            "genre_set": ("Crafting", "Simulation", "Management"),
+            "short_description": "Smelt impossible metals and build heirloom machines in a volcanic forge-town.",
+            "description": "Manage artisans, fuel towering furnaces, and turn molten experiments into prized commissions in a dramatic crafting sim."
+        },
+        {
+            "display_name": "Mosaic Drift",
+            "content_kind": "game",
+            "genre_set": ("Puzzle", "Abstract", "Relaxing"),
+            "short_description": "Slide luminous tiles through a dreamlike gallery of moving murals.",
+            "description": "Reassemble giant living mosaics by shifting color, rhythm, and reflection across serene abstract puzzle spaces."
+        },
+        {
+            "display_name": "Echo Harborline",
+            "content_kind": "game",
+            "genre_set": ("Adventure", "Mystery", "Story Rich"),
+            "short_description": "Ride a ghost train down the coast and interview every passenger before dawn.",
+            "description": "Investigate missing signals, solve carriage-room mysteries, and piece together a seaside disappearance aboard a haunted late-night rail line."
+        },
+        {
+            "display_name": "Pioneer Broadcast",
+            "content_kind": "app",
+            "genre_set": ("Creator Tools", "Automation", "Cloud"),
+            "short_description": "Design polished show packages, alerts, and overlays for community broadcasts.",
+            "description": "Pioneer Broadcast gives stream teams scene automation, event triggers, and branded templates for live community showcases."
+        },
+        {
+            "display_name": "Cascade Courier",
+            "content_kind": "game",
+            "genre_set": ("Platformer", "Adventure", "Action"),
+            "short_description": "Leap waterfalls, zipline ravines, and deliver fragile cargo against the clock.",
+            "description": "Chain movement tricks through mountain villages, storm drains, and canyon cranes in a courier platformer built around momentum."
+        },
+        {
+            "display_name": "Festival Foundry",
+            "content_kind": "game",
+            "genre_set": ("Party", "Crafting", "Family"),
+            "short_description": "Build giant parade creatures and set the whole city dancing.",
+            "description": "Gather materials, improvise absurd festival floats, and trigger cheerful disasters in a colorful party game about collaborative making."
+        },
+        {
+            "display_name": "Beacon Boardwalk",
+            "content_kind": "game",
+            "genre_set": ("Strategy", "Board Game", "Family"),
+            "short_description": "Claim glowing promenade routes and outscore rivals before high tide hits.",
+            "description": "Lay kiosks, steer tourist traffic, and chain beacon towers across a rain-slick amusement pier in a board-inspired strategy showdown."
+        },
+        {
+            "display_name": "Cloudline Studio",
+            "content_kind": "app",
+            "genre_set": ("Creator Tools", "Productivity", "Cloud"),
+            "short_description": "Storyboard releases, marketing beats, and media kits from one polished workspace.",
+            "description": "Cloudline Studio helps small teams organize title pages, media drops, and launch checklists with a clean cloud-first publishing dashboard."
+        },
+        {
+            "display_name": "Cobalt Almanac",
+            "content_kind": "app",
+            "genre_set": ("Productivity", "Reference", "Utility"),
+            "short_description": "Track seasonal events, notes, and campaign lore in a glowing modular codex.",
+            "description": "Cobalt Almanac is a richly visual lorebook and planning app with timeline cards, searchable notes, and shareable seasonal calendars."
+        },
+        {
+            "display_name": "Hearthside Protocol",
+            "content_kind": "game",
+            "genre_set": ("Co-op", "Survival", "Story Rich"),
+            "short_description": "Keep one last mountain refuge alive through the longest winter on record.",
+            "description": "Scavenge supplies, restore heat, and make hard communal choices inside a snowbound refuge where every room tells a personal story."
+        },
     ]
 
     seen_slugs: set[str] = set()
@@ -3316,14 +3810,15 @@ def build_local_seed_titles(studios: Sequence[LocalSeedStudio]) -> list[dict[str
 
     for studio_index, studio in enumerate(studios):
         for local_index in range(3):
-            name = title_nouns[title_index % len(title_nouns)]
+            concept = title_concepts[title_index % len(title_concepts)]
+            name = str(concept["display_name"])
             slug = slugify_for_seed(name)
             while slug in seen_slugs:
                 slug = f"{slug}-{title_index + 1}"
             seen_slugs.add(slug)
 
-            genre_set = genre_sets[(studio_index + local_index) % len(genre_sets)]
-            content_kind = "app" if title_index in {3, 11, 19, 25} else "game"
+            genre_set = tuple(str(candidate) for candidate in concept["genre_set"])
+            content_kind = str(concept["content_kind"])
             lifecycle_status = (
                 "draft" if title_index % 6 == 0 else
                 "testing" if title_index % 4 == 0 else
@@ -3340,17 +3835,13 @@ def build_local_seed_titles(studios: Sequence[LocalSeedStudio]) -> list[dict[str
             min_age_years = 6 + (title_index % 8)
             age_rating_value = "E" if min_age_years <= 7 else "E10+" if min_age_years <= 11 else "T"
 
-            short_description = short_hooks[title_index % len(short_hooks)]
-            description = (
-                f"{name} by {studio.display_name} blends {', '.join(genre_set)} play with "
-                f"a polished progression loop designed for tabletop and digital fans. "
-                "Sessions scale for solo runs, couch groups, and rotating seasonal challenges."
-            )
+            short_description = str(concept["short_description"])
+            description = f"{concept['description']} Developed by {studio.display_name}."
 
             titles.append(
                 {
                     "title_index": title_index,
-                    "organization_slug": studio.slug,
+                    "studio_slug": studio.slug,
                     "display_name": name,
                     "slug": slug,
                     "content_kind": content_kind,
@@ -3415,145 +3906,61 @@ def slugify_for_seed(value: str) -> str:
     return slug.strip("-")
 
 
-def generate_local_seed_media_assets(*, titles: Sequence[dict[str, Any]], media_root: Path, reset_media: bool) -> None:
-    """Generate deterministic PNG card/hero/logo assets for seed titles.
+def validate_local_seed_media_assets(
+    *,
+    titles: Sequence[dict[str, Any]],
+    studios: Sequence[LocalSeedStudio],
+    media_root: Path,
+    reset_media: bool,
+    config: DevConfig,
+) -> None:
+    """Validate checked-in seed media bundles and optionally clear legacy generated output.
 
     Args:
         titles: Seed title payloads.
-        media_root: Output root path.
-        reset_media: Whether to clear existing generated assets.
+        studios: Seed studios.
+        media_root: Checked-in static media root path.
+        reset_media: Whether to remove the obsolete generated-media directory.
+        config: CLI configuration for resolving repository paths.
 
     Returns:
         None.
+
+    Raises:
+        DevCliError: If any required media asset is missing.
     """
 
-    if reset_media and media_root.exists():
-        shutil.rmtree(media_root)
-    media_root.mkdir(parents=True, exist_ok=True)
+    if not media_root.exists():
+        raise DevCliError(f"Checked-in seed media root was not found: {media_root}")
+
+    missing_assets: list[str] = []
+    for studio in studios:
+        studio_logo_path = media_root / 'studios' / studio.slug / 'logo.svg'
+        studio_banner_png_path = media_root / 'studios' / studio.slug / 'banner.png'
+        studio_banner_svg_path = media_root / 'studios' / studio.slug / 'banner.svg'
+        if not studio_logo_path.exists():
+            missing_assets.append(str(studio_logo_path.relative_to(config.repo_root)))
+        if not studio_banner_png_path.exists() and not studio_banner_svg_path.exists():
+            missing_assets.append(str(studio_banner_svg_path.relative_to(config.repo_root)))
 
     for title in titles:
-        title_slug = str(title["slug"])
+        title_slug = str(title['slug'])
         title_directory = media_root / title_slug
-        title_directory.mkdir(parents=True, exist_ok=True)
+        for media_role in ('card', 'hero', 'logo'):
+            expected_path = title_directory / f'{media_role}.png'
+            if not expected_path.exists():
+                missing_assets.append(str(expected_path.relative_to(config.repo_root)))
 
-        primary_color, secondary_color, accent_color = derive_seed_palette(
-            f"{title['organization_slug']}::{title_slug}::{title['content_kind']}"
-        )
-        write_seed_png(
-            path=title_directory / "card.png",
-            width=640,
-            height=360,
-            primary_color=primary_color,
-            secondary_color=secondary_color,
-            accent_color=accent_color,
-        )
-        write_seed_png(
-            path=title_directory / "hero.png",
-            width=1200,
-            height=675,
-            primary_color=secondary_color,
-            secondary_color=primary_color,
-            accent_color=accent_color,
-        )
-        write_seed_png(
-            path=title_directory / "logo.png",
-            width=512,
-            height=512,
-            primary_color=accent_color,
-            secondary_color=primary_color,
-            accent_color=secondary_color,
-        )
+    if missing_assets:
+        preview = "\n".join(missing_assets[:20])
+        remainder = len(missing_assets) - min(20, len(missing_assets))
+        suffix = f"\n...and {remainder} more" if remainder > 0 else ""
+        raise DevCliError(f"Checked-in seed media assets are missing:\n{preview}{suffix}")
 
-
-def derive_seed_palette(seed: str) -> tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]:
-    """Derive a deterministic color palette from a seed string.
-
-    Args:
-        seed: Seed key.
-
-    Returns:
-        Tuple of RGB colors for primary, secondary, and accent usage.
-    """
-
-    digest = hashlib.sha256(seed.encode("utf-8")).digest()
-
-    def color(offset: int) -> tuple[int, int, int]:
-        red = 48 + digest[offset] % 160
-        green = 48 + digest[offset + 1] % 160
-        blue = 48 + digest[offset + 2] % 160
-        return red, green, blue
-
-    return color(0), color(3), color(6)
-
-
-def write_seed_png(
-    *,
-    path: Path,
-    width: int,
-    height: int,
-    primary_color: tuple[int, int, int],
-    secondary_color: tuple[int, int, int],
-    accent_color: tuple[int, int, int],
-) -> None:
-    """Write a deterministic RGB PNG with gradient + stripe accents.
-
-    Args:
-        path: Output image path.
-        width: Pixel width.
-        height: Pixel height.
-        primary_color: Primary RGB color.
-        secondary_color: Secondary RGB color.
-        accent_color: Accent RGB color.
-
-    Returns:
-        None.
-    """
-
-    if width <= 0 or height <= 0:
-        raise DevCliError("Image dimensions must be positive.")
-
-    row_bytes = bytearray()
-    stripe_width = max(8, width // 14)
-    stripe_offset = (accent_color[0] + accent_color[1] + accent_color[2]) % stripe_width
-
-    for y in range(height):
-        row_bytes.append(0)  # PNG filter type 0 (None).
-        vertical_mix = y / max(1, height - 1)
-        for x in range(width):
-            horizontal_mix = x / max(1, width - 1)
-            red = int(primary_color[0] * (1 - horizontal_mix) + secondary_color[0] * horizontal_mix)
-            green = int(primary_color[1] * (1 - vertical_mix) + secondary_color[1] * vertical_mix)
-            blue = int(primary_color[2] * (1 - horizontal_mix) + secondary_color[2] * horizontal_mix)
-
-            if ((x + stripe_offset) // stripe_width) % 3 == 0:
-                red = min(255, int((red + accent_color[0]) / 2) + 10)
-                green = min(255, int((green + accent_color[1]) / 2) + 6)
-                blue = min(255, int((blue + accent_color[2]) / 2) + 10)
-
-            row_bytes.extend((red, green, blue))
-
-    png_payload = bytearray()
-    png_payload.extend(b"\x89PNG\r\n\x1a\n")
-    png_payload.extend(make_png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)))
-    png_payload.extend(make_png_chunk(b"IDAT", zlib.compress(bytes(row_bytes), level=9)))
-    png_payload.extend(make_png_chunk(b"IEND", b""))
-
-    path.write_bytes(bytes(png_payload))
-
-
-def make_png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
-    """Build a PNG chunk with CRC metadata.
-
-    Args:
-        chunk_type: Four-byte chunk type.
-        payload: Chunk payload bytes.
-
-    Returns:
-        Encoded PNG chunk.
-    """
-
-    crc = zlib.crc32(chunk_type + payload) & 0xFFFFFFFF
-    return struct.pack(">I", len(payload)) + chunk_type + payload + struct.pack(">I", crc)
+    if reset_media:
+        legacy_root = config.repo_root / LEGACY_LOCAL_SEED_GENERATED_IMAGE_PATH
+        if legacy_root.exists():
+            shutil.rmtree(legacy_root)
 
 
 def build_local_seed_sql_script(
@@ -3562,6 +3969,7 @@ def build_local_seed_sql_script(
     user_subjects: dict[str, str],
     studios: Sequence[LocalSeedStudio],
     titles: Sequence[dict[str, Any]],
+    media_root: Path,
 ) -> str:
     """Build SQL script for deterministic local seed data insertion.
 
@@ -3578,7 +3986,7 @@ def build_local_seed_sql_script(
     now = datetime.now(timezone.utc)
     sql_lines = [
         "BEGIN;",
-        "TRUNCATE TABLE release_artifacts, title_releases, title_media_assets, title_integration_bindings, integration_connections, title_metadata_versions, titles, studio_memberships, studios, user_board_profiles RESTART IDENTITY CASCADE;",
+        "TRUNCATE TABLE release_artifacts, title_releases, title_media_assets, title_integration_bindings, integration_connections, title_metadata_versions, titles, studio_links, studio_memberships, studios, user_board_profiles RESTART IDENTITY CASCADE;",
     ]
 
     app_user_ids: dict[str, str] = {}
@@ -3613,28 +4021,37 @@ def build_local_seed_sql_script(
             f"VALUES ({sql_literal(user_id)}, {sql_literal(board_user_id)}, {sql_literal(user.display_name)}, {sql_literal(f'https://cdn.board.fun/avatars/{board_user_id}.png')}, {sql_literal(now)}, {sql_literal(now)}, {sql_literal(now)}, {sql_literal(now)});"
         )
 
-    organization_ids: dict[str, str] = {}
+    studio_ids: dict[str, str] = {}
     for studio in studios:
-        organization_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/orgs/{studio.slug}"))
-        organization_ids[studio.slug] = organization_id
-        logo_url = f"https://localhost:7277/test-images/generated/{studio.slug.replace('-', '_')}/logo.png"
+        studio_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/studios/{studio.slug}"))
+        studio_ids[studio.slug] = studio_id
+        logo_url = f"https://localhost:7277/test-images/seed-catalog/studios/{studio.slug}/logo.svg"
+        banner_path = media_root / "studios" / studio.slug / "banner.png"
+        banner_extension = "png" if banner_path.exists() and banner_path.suffix.lower() == ".png" else "svg"
+        banner_url = f"https://localhost:7277/test-images/seed-catalog/studios/{studio.slug}/banner.{banner_extension}"
         sql_lines.append(
-            "INSERT INTO studios (id, slug, display_name, description, logo_url, created_at, updated_at) "
-            f"VALUES ({sql_literal(organization_id)}, {sql_literal(studio.slug)}, {sql_literal(studio.display_name)}, {sql_literal(studio.description)}, {sql_literal(logo_url)}, {sql_literal(now)}, {sql_literal(now)});"
+            "INSERT INTO studios (id, slug, display_name, description, logo_url, banner_url, created_at, updated_at) "
+            f"VALUES ({sql_literal(studio_id)}, {sql_literal(studio.slug)}, {sql_literal(studio.display_name)}, {sql_literal(studio.description)}, {sql_literal(logo_url)}, {sql_literal(banner_url)}, {sql_literal(now)}, {sql_literal(now)});"
         )
         sql_lines.append(
-            "INSERT INTO studio_memberships (organization_id, user_id, role, created_at, updated_at) "
-            f"VALUES ({sql_literal(organization_id)}, {sql_literal(app_user_ids[studio.owner_username])}, 'owner', {sql_literal(now)}, {sql_literal(now)});"
+            "INSERT INTO studio_memberships (studio_id, user_id, role, created_at, updated_at) "
+            f"VALUES ({sql_literal(studio_id)}, {sql_literal(app_user_ids[studio.owner_username])}, 'owner', {sql_literal(now)}, {sql_literal(now)});"
         )
+        for link_label, link_url in studio.links:
+            link_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/studio-links/{studio.slug}/{link_label}/{link_url}"))
+            sql_lines.append(
+                "INSERT INTO studio_links (id, studio_id, label, url, created_at, updated_at) "
+                f"VALUES ({sql_literal(link_id)}, {sql_literal(studio_id)}, {sql_literal(link_label)}, {sql_literal(link_url)}, {sql_literal(now)}, {sql_literal(now)});"
+            )
 
     contributor_memberships = [
         ("quartz-rabbit-studio", "zoe.martin", "editor"),
         ("blue-harbor-games", "isaac.romero", "admin"),
     ]
-    for organization_slug, username, membership_role in contributor_memberships:
+    for studio_slug, username, membership_role in contributor_memberships:
         sql_lines.append(
-            "INSERT INTO studio_memberships (organization_id, user_id, role, created_at, updated_at) "
-            f"VALUES ({sql_literal(organization_ids[organization_slug])}, {sql_literal(app_user_ids[username])}, {sql_literal(membership_role)}, {sql_literal(now)}, {sql_literal(now)});"
+            "INSERT INTO studio_memberships (studio_id, user_id, role, created_at, updated_at) "
+            f"VALUES ({sql_literal(studio_ids[studio_slug])}, {sql_literal(app_user_ids[username])}, {sql_literal(membership_role)}, {sql_literal(now)}, {sql_literal(now)});"
         )
 
     title_ids: dict[str, str] = {}
@@ -3643,11 +4060,11 @@ def build_local_seed_sql_script(
 
     for title in titles:
         title_slug = str(title["slug"])
-        title_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/titles/{title['organization_slug']}/{title_slug}"))
+        title_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/titles/{title['studio_slug']}/{title_slug}"))
         title_ids[title_slug] = title_id
         sql_lines.append(
-            "INSERT INTO titles (id, organization_id, slug, content_kind, lifecycle_status, visibility, current_metadata_version_id, current_release_id, created_at, updated_at) "
-            f"VALUES ({sql_literal(title_id)}, {sql_literal(organization_ids[str(title['organization_slug'])])}, {sql_literal(title_slug)}, {sql_literal(str(title['content_kind']))}, {sql_literal(str(title['lifecycle_status']))}, {sql_literal(str(title['visibility']))}, NULL, NULL, {sql_literal(now)}, {sql_literal(now)});"
+            "INSERT INTO titles (id, studio_id, slug, content_kind, lifecycle_status, visibility, current_metadata_version_id, current_release_id, created_at, updated_at) "
+            f"VALUES ({sql_literal(title_id)}, {sql_literal(studio_ids[str(title['studio_slug'])])}, {sql_literal(title_slug)}, {sql_literal(str(title['content_kind']))}, {sql_literal(str(title['lifecycle_status']))}, {sql_literal(str(title['visibility']))}, NULL, NULL, {sql_literal(now)}, {sql_literal(now)});"
         )
 
         revision_count = 2 if int(title["title_index"]) % 3 == 0 else 1
@@ -3699,14 +4116,14 @@ def build_local_seed_sql_script(
 
         assigned_media_roles: set[str] = set(title["media_assignments"])
         for media_role, (width, height) in {
-            "card": (640, 360),
-            "hero": (1200, 675),
-            "logo": (512, 512),
+            "card": (900, 1280),
+            "hero": (1600, 900),
+            "logo": (1200, 400),
         }.items():
             if media_role not in assigned_media_roles:
                 continue
             media_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/title-media/{title_slug}/{media_role}"))
-            media_url = f"https://localhost:7277/test-images/generated/{title_slug}/{media_role}.png"
+            media_url = f"https://localhost:7277/test-images/seed-catalog/{title_slug}/{media_role}.png"
             sql_lines.append(
                 "INSERT INTO title_media_assets (id, title_id, media_role, source_url, alt_text, mime_type, width, height, created_at, updated_at) "
                 f"VALUES ({sql_literal(media_id)}, {sql_literal(title_id)}, {sql_literal(media_role)}, {sql_literal(media_url)}, {sql_literal(str(title['display_name']) + ' ' + media_role + ' art')}, 'image/png', {width}, {height}, {sql_literal(now)}, {sql_literal(now)});"
@@ -3725,14 +4142,14 @@ def build_local_seed_sql_script(
             custom_name = f"{studio.display_name} Direct"
             custom_url = f"https://{studio.slug}.example.com"
             sql_lines.append(
-                "INSERT INTO integration_connections (id, organization_id, supported_publisher_id, custom_publisher_display_name, custom_publisher_homepage_url, config_json, is_enabled, created_at, updated_at) "
-                f"VALUES ({sql_literal(connection_id)}, {sql_literal(organization_ids[studio.slug])}, NULL, {sql_literal(custom_name)}, {sql_literal(custom_url)}, {sql_jsonb({'connectionMode': 'direct', 'sandbox': True})}, TRUE, {sql_literal(now)}, {sql_literal(now)});"
+                "INSERT INTO integration_connections (id, studio_id, supported_publisher_id, custom_publisher_display_name, custom_publisher_homepage_url, config_json, is_enabled, created_at, updated_at) "
+                f"VALUES ({sql_literal(connection_id)}, {sql_literal(studio_ids[studio.slug])}, NULL, {sql_literal(custom_name)}, {sql_literal(custom_url)}, {sql_jsonb({'connectionMode': 'direct', 'sandbox': True})}, TRUE, {sql_literal(now)}, {sql_literal(now)});"
             )
         else:
             publisher_id = supported_publisher_ids[studio_index % len(supported_publisher_ids)]
             sql_lines.append(
-                "INSERT INTO integration_connections (id, organization_id, supported_publisher_id, custom_publisher_display_name, custom_publisher_homepage_url, config_json, is_enabled, created_at, updated_at) "
-                f"VALUES ({sql_literal(connection_id)}, {sql_literal(organization_ids[studio.slug])}, {sql_literal(publisher_id)}, NULL, NULL, {sql_jsonb({'sandbox': True, 'channel': 'local-seed'})}, TRUE, {sql_literal(now)}, {sql_literal(now)});"
+                "INSERT INTO integration_connections (id, studio_id, supported_publisher_id, custom_publisher_display_name, custom_publisher_homepage_url, config_json, is_enabled, created_at, updated_at) "
+                f"VALUES ({sql_literal(connection_id)}, {sql_literal(studio_ids[studio.slug])}, {sql_literal(publisher_id)}, NULL, NULL, {sql_jsonb({'sandbox': True, 'channel': 'local-seed'})}, TRUE, {sql_literal(now)}, {sql_literal(now)});"
             )
 
     for title in titles:
@@ -3741,12 +4158,12 @@ def build_local_seed_sql_script(
             continue
 
         title_slug = str(title["slug"])
-        organization_slug = str(title["organization_slug"])
+        studio_slug = str(title["studio_slug"])
         binding_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://boardtpl.dev/seed/title-bindings/{title_slug}"))
-        acquisition_url = f"https://{organization_slug}.example.com/titles/{title_slug}"
+        acquisition_url = f"https://{studio_slug}.example.com/titles/{title_slug}"
         sql_lines.append(
             "INSERT INTO title_integration_bindings (id, title_id, integration_connection_id, acquisition_url, acquisition_label, config_json, is_primary, is_enabled, created_at, updated_at) "
-            f"VALUES ({sql_literal(binding_id)}, {sql_literal(title_ids[title_slug])}, {sql_literal(integration_connection_ids[organization_slug])}, {sql_literal(acquisition_url)}, {sql_literal('Open publisher page')}, {sql_jsonb({'seeded': True})}, TRUE, TRUE, {sql_literal(now)}, {sql_literal(now)});"
+            f"VALUES ({sql_literal(binding_id)}, {sql_literal(title_ids[title_slug])}, {sql_literal(integration_connection_ids[studio_slug])}, {sql_literal(acquisition_url)}, {sql_literal('Open publisher page')}, {sql_jsonb({'seeded': True})}, TRUE, TRUE, {sql_literal(now)}, {sql_literal(now)});"
         )
 
     sql_lines.append("COMMIT;")
@@ -4298,7 +4715,7 @@ def build_parser() -> argparse.ArgumentParser:
     seed_data.add_argument(
         "--reset-media",
         action="store_true",
-        help="Delete and regenerate local generated test images before seeding",
+        help="Delete the legacy generated-media cache before validating static seed assets",
     )
     seed_data.add_argument(
         "--seed-password",

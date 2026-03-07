@@ -55,7 +55,7 @@ Status: in progress
 
 ## Wave 7: Developer And Moderation Workflow Console
 
-Status: in progress
+Status: completed on March 7, 2026
 
 ### Chunk 1: Develop Workspace Shell
 
@@ -107,6 +107,25 @@ Status: in progress
 - test gate:
   - seed command can be rerun idempotently
   - backend/frontend route and integration tests remain green after reseed
+
+### Chunk 5: Studio Branding, Public Links, And Catalog UX Alignment
+
+- extend studio management and public studio pages with:
+  - studio logo upload/URL support
+  - studio banner upload/URL support
+  - public studio links for social/support/promotional destinations
+  - icon rendering for known social hosts plus fallback text links for other hosts
+- align the per-studio public catalog page with the shared `/browse` search/filter UX:
+  - live client-side filtering
+  - no apply button or route reload for filter changes
+  - compact paged card-grid results
+  - results-per-page control
+  - in-page quick-view modal for title details
+- remove obsolete standalone `/develop/studios/...` pages that are superseded by the in-place `/develop` studio workflows
+- test gate:
+  - OpenAPI and Postman contract assets include the studio link and media-upload surfaces
+  - backend endpoint and integration tests cover studio links and studio media persistence
+  - frontend route smoke/tests reflect the shared browse/studio UX and removed obsolete routes
 
 ## Wave 8: Unified Commerce And Entitlements
 
