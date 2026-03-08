@@ -48,7 +48,7 @@ class DevCliMigrationHelperTests(unittest.TestCase):
 
             config = dev.config_from_args(args, repo_root)
 
-            self.assertEqual("apps/spa", config.migration_spa_root)
+            self.assertEqual("frontend", config.migration_spa_root)
             self.assertEqual("backend/apps/workers-api", config.migration_workers_root)
             self.assertEqual("backend/supabase", config.supabase_root)
 

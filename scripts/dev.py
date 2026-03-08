@@ -53,8 +53,6 @@ class DevConfig:
     Attributes:
         repo_root: Repository root directory.
         frontend_root: Relative path to the frontend submodule root.
-        frontend_web_project: Relative path to the frontend web project file.
-        frontend_solution: Relative path to the frontend solution file.
         frontend_package_json: Relative path to the frontend package manifest.
         backend_base_url: Default local backend base URL.
         frontend_base_url: Default local frontend base URL.
@@ -82,8 +80,6 @@ class DevConfig:
 
     repo_root: Path
     frontend_root: str
-    frontend_web_project: str
-    frontend_solution: str
     frontend_package_json: str
     backend_base_url: str
     frontend_base_url: str
@@ -871,37 +867,6 @@ def start_background_command(
     return process
 
 
-DOTNET_WATCH_ENC_CRASH_MARKERS = (
-    "An unexpected error occurred: System.InvalidOperationException: Unexpected value 'Block'",
-    "Microsoft.CodeAnalysis.CSharp.LambdaUtilities.TryGetCorrespondingLambdaBody",
-)
-
-
-def is_known_dotnet_watch_enc_crash(*, return_code: int, log_path: Path | None = None) -> bool:
-    """Return whether a ``dotnet watch`` exit matches the known Roslyn EnC crash signature.
-
-    Args:
-        return_code: Process exit code from ``dotnet watch``.
-        log_path: Optional log file path to inspect for crash markers.
-
-    Returns:
-        ``True`` when the exit/signature matches the known crash pattern.
-    """
-
-    if return_code != -1:
-        return False
-
-    if log_path is None or not log_path.exists():
-        return True
-
-    try:
-        text = log_path.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return True
-
-    return any(marker in text for marker in DOTNET_WATCH_ENC_CRASH_MARKERS)
-
-
 def ensure_api_base_url_reachable(base_url: str) -> None:
     """Ensure the target API base URL is reachable before contract execution.
 
@@ -924,7 +889,7 @@ def ensure_api_base_url_reachable(base_url: str) -> None:
         raise DevCliError(
             f"API base URL is not reachable: {base_url}{detail_suffix}\n"
             "Start the maintained backend in another terminal with 'python ./scripts/dev.py workers run' "
-            "or rerun this command with '--start-backend'."
+            "or rerun this command with '--start-workers'."
         )
 
     raise DevCliError(f"API base URL is not reachable: {base_url}{detail_suffix}")
@@ -1020,7 +985,7 @@ def run_backend_api(config: DevConfig, *, do_restore: bool) -> None:
 
     Args:
         config: CLI configuration containing backend project paths.
-        do_restore: Whether to run ``dotnet restore`` before starting the API.
+        do_restore: Whether to install root npm workspace dependencies before starting the API.
 
     Returns:
         None.
@@ -1129,6 +1094,7 @@ def run_full_local_web_stack(
             cwd=config.repo_root,
             log_name="migration-spa.log",
             config=config,
+            env=build_migration_frontend_environment(config, runtime_env=runtime_env),
         )
         print(f"Frontend log: {frontend_log_path}")
         wait_for_background_process_http_ready(
@@ -1308,77 +1274,6 @@ def start_background_command_with_log(
     return process, log_path
 
 
-def get_frontend_web_launch_command(project_path: Path, *, hot_reload: bool) -> list[str]:
-    """Return the frontend web launch command.
-
-    Args:
-        project_path: Frontend web project path.
-        hot_reload: Whether to launch with ``dotnet watch``.
-
-    Returns:
-        Command tokens for launching the frontend web app.
-    """
-
-    if hot_reload:
-        return ["dotnet", "watch", "--project", str(project_path), "run", "--no-restore", "--no-launch-profile"]
-
-    return ["dotnet", "run", "--project", str(project_path), "--no-restore", "--no-launch-profile"]
-
-
-def build_frontend_web_environment(*, frontend_url: str, hot_reload: bool) -> dict[str, str]:
-    """Build the environment used by frontend web runs.
-
-    Args:
-        frontend_url: URL the frontend should bind to.
-        hot_reload: Whether frontend hot reload is enabled.
-
-    Returns:
-        Environment variables for the frontend process.
-    """
-
-    extra = {
-        "ASPNETCORE_URLS": frontend_url,
-        "ASPNETCORE_ENVIRONMENT": "Development",
-    }
-    if hot_reload:
-        extra["DOTNET_WATCH_RESTART_ON_RUDE_EDIT"] = "true"
-
-    return build_subprocess_env(extra=extra)
-
-
-def start_frontend_web_process_with_log(
-    config: DevConfig,
-    *,
-    frontend_url: str,
-    hot_reload: bool,
-) -> tuple[subprocess.Popen, Path]:
-    """Start the frontend web app and return both process and log path.
-
-    Args:
-        config: CLI configuration containing frontend paths.
-        frontend_url: URL the frontend should bind to.
-        hot_reload: Whether frontend hot reload is enabled.
-
-    Returns:
-        Tuple of process handle and log file path.
-    """
-
-    assert_command_available("dotnet")
-    frontend_root = config.repo_root / config.frontend_root
-    project_path = config.repo_root / config.frontend_web_project
-    if not project_path.exists():
-        raise DevCliError(f"Frontend web project not found: {project_path}")
-    ensure_local_url_port_available(url=frontend_url, description="frontend web UI")
-
-    return start_background_command_with_log(
-        cmd=get_frontend_web_launch_command(project_path, hot_reload=hot_reload),
-        cwd=frontend_root,
-        log_name="frontend-web.log",
-        config=config,
-        env=build_frontend_web_environment(frontend_url=frontend_url, hot_reload=hot_reload),
-    )
-
-
 def run_tests(config: DevConfig, *, run_integration: bool, restore: bool = True) -> None:
     """Run maintained backend verification and optionally integration coverage.
 
@@ -1415,46 +1310,38 @@ def run_tests(config: DevConfig, *, run_integration: bool, restore: bool = True)
 
 
 def restore_frontend(config: DevConfig) -> None:
-    """Restore the frontend solution.
+    """Ensure maintained frontend workspace dependencies are installed.
 
     Args:
-        config: CLI configuration containing frontend solution paths.
+        config: CLI configuration containing maintained frontend paths.
 
     Returns:
         None.
-
-    Raises:
-        DevCliError: If ``dotnet`` is unavailable or restore fails.
     """
 
-    assert_command_available("dotnet")
-    frontend_root = config.repo_root / config.frontend_root
-    solution_path = config.repo_root / config.frontend_solution
-    write_step("Restoring frontend solution")
-    run_command(["dotnet", "restore", str(solution_path)], cwd=frontend_root)
+    assert_command_available("npm")
+    ensure_migration_workspace_scaffolding(config)
+    install_migration_workspace_dependencies(config)
 
 
 def run_frontend_tests(config: DevConfig, *, restore: bool = True) -> None:
-    """Run frontend tests.
+    """Run maintained frontend tests.
 
     Args:
-        config: CLI configuration containing frontend test project/solution paths.
-        restore: Whether to restore packages before running tests.
+        config: CLI configuration containing maintained frontend paths.
+        restore: Whether to install root npm workspace dependencies before running tests.
 
     Returns:
         None.
-
-    Raises:
-        DevCliError: If ``dotnet`` is unavailable or test execution fails.
     """
 
-    assert_command_available("dotnet")
-    frontend_root = config.repo_root / config.frontend_root
-    solution_path = config.repo_root / config.frontend_solution
-    restore_args = [] if restore else ["--no-restore"]
+    assert_command_available("npm")
+    ensure_migration_workspace_scaffolding(config)
+    if restore:
+        install_migration_workspace_dependencies(config)
 
     write_step("Running frontend tests")
-    run_command(["dotnet", "test", str(solution_path), *restore_args], cwd=frontend_root)
+    run_command(build_workspace_npm_command(script_name="test", workspace_name=config.migration_spa_workspace_name), cwd=config.repo_root)
 
 
 def build_subprocess_env(*, extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -1471,6 +1358,26 @@ def build_subprocess_env(*, extra: dict[str, str] | None = None) -> dict[str, st
     if extra:
         env.update({key: value for key, value in extra.items() if value is not None})
     return env
+
+
+def build_migration_frontend_environment(config: DevConfig, *, runtime_env: dict[str, str]) -> dict[str, str]:
+    """Build the Vite runtime environment for the maintained frontend workspace.
+
+    Args:
+        config: CLI configuration containing maintained local URLs.
+        runtime_env: Local Supabase runtime values resolved from the CLI.
+
+    Returns:
+        Environment mapping with the Vite runtime values injected.
+    """
+
+    return build_subprocess_env(
+        extra={
+            "VITE_API_BASE_URL": config.migration_workers_base_url,
+            "VITE_SUPABASE_URL": runtime_env["SUPABASE_URL"],
+            "VITE_SUPABASE_ANON_KEY": runtime_env["SUPABASE_ANON_KEY"],
+        }
+    )
 
 
 def build_workspace_npm_command(*, script_name: str, workspace_name: str) -> list[str]:
@@ -2053,8 +1960,13 @@ def run_migration_spa_command(
         return
 
     if action == "run":
+        runtime_env = get_local_supabase_runtime(config)
         write_step(f"Starting migration React SPA at {config.migration_spa_base_url} (Ctrl+C to stop)")
-        run_command(build_workspace_npm_command(script_name="dev", workspace_name=config.migration_spa_workspace_name), cwd=config.repo_root)
+        run_command(
+            build_workspace_npm_command(script_name="dev", workspace_name=config.migration_spa_workspace_name),
+            cwd=config.repo_root,
+            env=build_migration_frontend_environment(config, runtime_env=runtime_env),
+        )
         return
 
     raise DevCliError(f"Unsupported SPA action: {action}")
@@ -2102,7 +2014,7 @@ def run_migration_workers_command(
 
 
 def seed_migration_data(config: DevConfig, *, seed_password: str) -> None:
-    """Seed deterministic Supabase auth, data, and storage fixtures for Wave 2.
+    """Seed deterministic Supabase auth, data, and storage fixtures for the maintained stack.
 
     Args:
         config: CLI configuration containing migration workspace paths.
@@ -2119,10 +2031,7 @@ def seed_migration_data(config: DevConfig, *, seed_password: str) -> None:
     asset_root = (
         config.repo_root
         / "frontend"
-        / "src"
-        / "Board.ThirdPartyLibrary.Frontend.Web"
-        / "wwwroot"
-        / "test-images"
+        / "public"
         / "seed-catalog"
     ).resolve()
     if not asset_root.exists():
@@ -2226,7 +2135,7 @@ def run_workers_smoke(
     moderator_token: str,
     developer_token: str,
 ) -> None:
-    """Run the Wave 2 Workers flow smoke suite.
+    """Run the maintained Workers flow smoke suite.
 
     Args:
         config: CLI configuration containing repository paths.
@@ -2246,7 +2155,7 @@ def run_workers_smoke(
             "NODE_TLS_REJECT_UNAUTHORIZED": "0" if is_local_http_url(base_url) and is_https_url(base_url) else None,
         }
     )
-    write_step("Running Wave 2 Workers flow smoke suite")
+    write_step("Running maintained Workers flow smoke suite")
     run_command(["npm", "run", "test:workers-smoke"], cwd=config.repo_root, env=env)
 
 
@@ -2259,7 +2168,7 @@ def run_workers_flow_smoke_command(
     developer_email: str,
     seed_password: str,
 ) -> None:
-    """Run the Wave 2 end-to-end Workers smoke suite.
+    """Run the maintained end-to-end Workers smoke suite.
 
     Args:
         config: CLI configuration containing repository paths.
@@ -2284,7 +2193,7 @@ def run_workers_flow_smoke_command(
             run_supabase_stack_command(config, action="db-reset")
             runtime_env = get_local_supabase_runtime(config)
             resolved_base_url = config.migration_workers_base_url
-            write_step("Starting migration Workers API in the background for Wave 2 smoke")
+            write_step("Starting migration Workers API in the background for Workers smoke")
             workers_process, workers_log_path = start_migration_workers_process(config, runtime_env=runtime_env)
             print(f"Workers API log: {workers_log_path}")
         else:
@@ -2445,7 +2354,7 @@ def run_parity_suite(
     env = build_subprocess_env(
         extra={
             "PARITY_BASE_URL": config.frontend_base_url,
-            "PARITY_ADMIN_USERNAME": "alex.rivera",
+            "PARITY_ADMIN_EMAIL": LOCAL_SEED_MODERATOR_EMAIL,
             "PARITY_ADMIN_PASSWORD": LOCAL_SEED_DEFAULT_PASSWORD,
             "NODE_TLS_REJECT_UNAUTHORIZED": "0" if is_https_url(config.frontend_base_url) else None,
         }
@@ -2605,16 +2514,9 @@ def run_api_spec_lint(config: DevConfig) -> None:
         ],
         cwd=config.repo_root,
         check=False,
-        capture_output=True,
     )
     if result.returncode != 0:
-        combined_output = "\n".join(
-            part.strip() for part in (result.stdout or "", result.stderr or "") if part and part.strip()
-        )
-        raise DevCliError(
-            "Redocly OpenAPI lint failed."
-            + (f"\n{combined_output}" if combined_output else "")
-        )
+        raise DevCliError("Redocly OpenAPI lint failed.")
     print("OpenAPI spec lint passed.")
 
 
@@ -2863,14 +2765,14 @@ def run_doctor(config: DevConfig) -> None:
     optional_issues: list[str] = []
 
     write_step("Environment checks")
-    for cmd in ("git", "docker", "dotnet", "python"):
+    for cmd in ("git", "docker", "python", "node", "npm"):
         if shutil.which(cmd):
             print(f"Found: {cmd}")
         else:
             print(f"Missing command: {cmd}")
             issues.append(f"Required command missing from PATH: {cmd}")
 
-    for cmd in ("node", "npm", "postman"):
+    for cmd in ("postman",):
         if shutil.which(cmd):
             print(f"Found (API/frontend workflow): {cmd}")
         else:
@@ -2907,12 +2809,6 @@ def run_doctor(config: DevConfig) -> None:
         write_step("Submodule status")
         run_command(["git", "submodule", "status"], cwd=config.repo_root, check=False, capture_output=False)
 
-    if shutil.which("dotnet"):
-        write_step(".NET SDK version")
-        result = run_command(["dotnet", "--version"], check=False, capture_output=False)
-        if result.returncode != 0:
-            issues.append("dotnet is installed but `dotnet --version` failed")
-
     if shutil.which("docker"):
         write_step("Docker version")
         result = run_command(["docker", "--version"], check=False, capture_output=False)
@@ -2924,6 +2820,8 @@ def run_doctor(config: DevConfig) -> None:
 
     maintained_paths = [
         ("Migration root package", config.repo_root / config.migration_root_package_json),
+        ("Frontend workspace", config.repo_root / config.migration_spa_root),
+        ("Frontend package manifest", config.repo_root / config.frontend_package_json),
         ("Workers workspace", config.repo_root / config.migration_workers_root),
         ("Workers Wrangler config", config.repo_root / config.migration_workers_root / "wrangler.jsonc"),
         ("Supabase project root", config.repo_root / config.supabase_root),
@@ -2951,8 +2849,9 @@ def run_doctor(config: DevConfig) -> None:
         print("  python ./scripts/dev.py up --dependencies-only")
         print("  python ./scripts/dev.py up --skip-restore")
         print("  python ./scripts/dev.py all-tests")
+        print("  python ./scripts/dev.py verify --start-workers")
         print("  python ./scripts/dev.py api-test --start-workers --skip-lint")
-        print("  python ./scripts/dev.py spa install")
+        print("  python ./scripts/dev.py spa run")
         print("  python ./scripts/dev.py workers build")
         print("  python ./scripts/dev.py supabase status")
     else:
@@ -2970,6 +2869,7 @@ def run_doctor(config: DevConfig) -> None:
         print("  python ./scripts/dev.py up --dependencies-only")
         print("  python ./scripts/dev.py up --skip-restore")
         print("  python ./scripts/dev.py all-tests")
+        print("  python ./scripts/dev.py verify --start-workers")
         print("  python ./scripts/dev.py api-test --start-workers --skip-lint")
         print("  python ./scripts/dev.py api-lint")
         print("  python ./scripts/dev.py spa run")
@@ -3006,6 +2906,7 @@ def run_verify(
 
     restore_backend(config)
     run_tests(config, run_integration=run_integration, restore=False)
+    run_frontend_tests(config, restore=False)
     run_root_python_tests(config)
     run_api_spec_lint(config)
 
@@ -3611,7 +3512,7 @@ def build_parser() -> argparse.ArgumentParser:
     workers_smoke = subparsers.add_parser(
         "workers-smoke",
         parents=[shared],
-        help="Run end-to-end Wave 2 Workers auth, data, and upload smoke coverage",
+        help="Run end-to-end Workers auth, data, and upload smoke coverage",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     workers_smoke.add_argument(
@@ -3693,8 +3594,6 @@ def config_from_args(args: argparse.Namespace, repo_root: Path) -> DevConfig:
     return DevConfig(
         repo_root=repo_root,
         frontend_root="frontend",
-        frontend_web_project="frontend/src/Board.ThirdPartyLibrary.Frontend.Web/Board.ThirdPartyLibrary.Frontend.Web.csproj",
-        frontend_solution="frontend/Board.ThirdPartyLibrary.Frontend.slnx",
         frontend_package_json="frontend/package.json",
         backend_base_url="http://127.0.0.1:8787",
         frontend_base_url="http://127.0.0.1:4173",
@@ -3706,7 +3605,7 @@ def config_from_args(args: argparse.Namespace, repo_root: Path) -> DevConfig:
         api_mock_admin_environment="api/postman/environments/board-enthusiasts_mock-admin.postman_environment.json",
         api_mock_provision_script="api/scripts/postman-provision-mock.mjs",
         migration_root_package_json="package.json",
-        migration_spa_root="apps/spa",
+        migration_spa_root="frontend",
         migration_spa_workspace_name="@board-enthusiasts/spa",
         migration_workers_root="backend/apps/workers-api",
         migration_workers_workspace_name="@board-enthusiasts/workers-api",

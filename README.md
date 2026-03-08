@@ -6,8 +6,8 @@ Current implementation status:
 
 - the maintained backend runtime now lives in the [`backend`](backend) submodule as Supabase + Cloudflare Workers
 - the maintained executable API contract now lives in the [`api`](api) submodule and targets the Workers/Supabase surface only
-- the current SPA under [`apps/spa`](apps/spa) is still an in-progress migration shell; Wave 3 remains responsible for the full frontend cutover
-- the current migration wave is Wave 2 platform and API cutover for the Cloudflare, Supabase, and Workers conversion plan
+- the maintained frontend runtime now lives in the [`frontend`](frontend) submodule as a React + TypeScript SPA
+- the current migration wave is Wave 3 frontend port and full cutover for the Cloudflare, Supabase, and Workers conversion plan
 
 ## Table of Contents
 
@@ -54,6 +54,7 @@ git submodule status
   - Developer CLI (root automation commands): [`docs/developer-cli.md`](docs/developer-cli.md)
   - Wave 1 migration foundation: [`docs/cloudflare-supabase-workers-wave-1.md`](docs/cloudflare-supabase-workers-wave-1.md)
   - Wave 2 platform/API cutover: [`docs/cloudflare-supabase-workers-wave-2.md`](docs/cloudflare-supabase-workers-wave-2.md)
+  - Wave 3 frontend cutover: [`docs/cloudflare-supabase-workers-wave-3.md`](docs/cloudflare-supabase-workers-wave-3.md)
 - Backend-specific developer docs (in backend submodule):
   - Backend local runbook: [`backend/docs/workers-backend-local-runbook.md`](backend/docs/workers-backend-local-runbook.md)
 

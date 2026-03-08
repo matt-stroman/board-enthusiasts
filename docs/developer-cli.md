@@ -38,7 +38,7 @@ The developer CLI orchestrates common local development tasks from the repositor
 - provision/sync Postman mocks and workspace artifacts
 - run environment diagnostics
 - seed deterministic local auth/catalog sample data for UI/UX testing
-- run Wave 1 and Wave 2 migration workspace commands for the React SPA, Workers API, Supabase local stack, parity baselines, seeded Supabase data, and staging deployment wrappers
+- run the maintained React SPA, Workers API, Supabase local stack, parity baselines, seeded Supabase data, and staging deployment wrappers
 
 ## Primary Entry Point
 
@@ -103,7 +103,7 @@ Use `web-stop` when a previous `web` session was interrupted and left the backen
 python ./scripts/dev.py up --dependencies-only
 ```
 
-### Seed local sample data for the maintained Wave 2 stack
+### Seed local sample data for the maintained stack
 
 ```bash
 python ./scripts/dev.py seed-data
@@ -113,7 +113,7 @@ This command:
 
 - ensures local Supabase services are running
 - provisions/updates deterministic local Supabase auth users
-- validates the checked-in title and studio media bundles under `frontend/src/Board.ThirdPartyLibrary.Frontend.Web/wwwroot/test-images/seed-catalog`
+- validates the checked-in title and studio media bundles under `frontend/public/seed-catalog`
 - repopulates local Supabase studio/title/media data used by the maintained Workers surface
 - seeds public studio banners plus studio support/social links alongside the studio records
 
@@ -130,7 +130,7 @@ Useful flags:
 python ./scripts/dev.py frontend
 ```
 
-This standalone frontend workflow runs the maintained SPA shell through the Vite dev server.
+This standalone frontend workflow runs the maintained SPA through the Vite dev server and injects the local Supabase runtime values expected by the app.
 
 Useful flags:
 
@@ -138,14 +138,15 @@ Useful flags:
 
 ## Migration Workflows
 
-Wave 1 and Wave 2 establish the maintained Cloudflare Workers + Supabase backend path and the SPA migration shell.
+Wave 3 finishes the maintained Cloudflare Workers + Supabase migration by making the `frontend` submodule SPA the default frontend path.
 
 Reference doc:
 
 - [`docs/cloudflare-supabase-workers-wave-1.md`](./cloudflare-supabase-workers-wave-1.md)
 - [`docs/cloudflare-supabase-workers-wave-2.md`](./cloudflare-supabase-workers-wave-2.md)
+- [`docs/cloudflare-supabase-workers-wave-3.md`](./cloudflare-supabase-workers-wave-3.md)
 
-### Install, build, or run the React SPA shell
+### Install, build, or run the maintained React SPA
 
 ```bash
 python ./scripts/dev.py spa install
@@ -374,10 +375,10 @@ The root CLI can populate the maintained authenticated contract checks automatic
 ## Notes
 
 - The `up`, `down`, and `status` commands now target the maintained local Supabase dependency path.
-- The Wave 1 and Wave 2 migration scaffolding expects `node`, `npm`, `supabase`, and `wrangler`.
+- The maintained migration stack expects `node`, `npm`, `supabase`, and `wrangler`.
 - VS Code tasks in this repo call the Python CLI directly.
 - The supported developer entry point for this repository is `python ./scripts/dev.py ...`; API-local helper scripts under `api/scripts/` are implementation details for CI and the root CLI.
 - Tool executables are resolved from each developer's `PATH`; the CLI does not assume fixed install directories for `node`, `npx`, `postman`, `supabase`, `wrangler`, `docker`, or other required tools.
-- Migration workspace dependency installs are now cached by lockfile fingerprint so routine Wave 2 commands do not reinstall the entire npm workspace unnecessarily.
+- Migration workspace dependency installs are cached by lockfile fingerprint so routine commands do not reinstall the entire npm workspace unnecessarily.
 
 
