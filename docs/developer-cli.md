@@ -16,7 +16,7 @@ This document provides quick guidance, common workflows, and project-specific no
 - [Purpose](#purpose)
 - [Primary Entry Point](#primary-entry-point)
 - [Common Workflows](#common-workflows)
-- [Database Backup and Restore](#database-backup-and-restore)
+- [Migration Workflows](#migration-workflows)
 - [Configuration Overrides](#configuration-overrides)
 - [Notes](#notes)
 
@@ -24,22 +24,21 @@ This document provides quick guidance, common workflows, and project-specific no
 
 The developer CLI orchestrates common local development tasks from the repository root:
 
-- bootstrap submodules and restore backend dependencies
+- bootstrap submodules and install maintained workspace dependencies
 - run the full local web stack from the repository root
 - inspect/stop the locally launched root web stack
-- run the frontend web UI from the repository root
-- start/stop/reuse local PostgreSQL, Mailpit, and Keycloak via Docker Compose
-- run the backend API
-- validate backend XML documentation coverage
-- run backend tests
-- run all major validation checks in one pass (backend docs + backend/frontend tests + API lint + API contract)
+- run the maintained SPA frontend from the repository root
+- start/stop/reuse local Supabase services
+- run the maintained backend API
+- run maintained backend verification
+- run all major validation checks in one pass (maintained backend tests + root CLI tests + frontend tests + API lint + API contract)
 - authenticate Postman CLI when Postman workspace or mock operations are needed
 - lint the Git-tracked OpenAPI specification with Redocly CLI
 - run API contract tests
 - provision/sync Postman mocks and workspace artifacts
 - run environment diagnostics
-- create/restore local PostgreSQL SQL backups
 - seed deterministic local auth/catalog sample data for UI/UX testing
+- run Wave 1 and Wave 2 migration workspace commands for the React SPA, Workers API, Supabase local stack, parity baselines, seeded Supabase data, and staging deployment wrappers
 
 ## Primary Entry Point
 
@@ -55,48 +54,36 @@ python ./scripts/dev.py <command> [options]
 
 ```bash
 python ./scripts/dev.py bootstrap
-python ./scripts/dev.py web --hot-reload
+python ./scripts/dev.py web
 ```
 
-This starts Docker dependencies, the backend API, the frontend web app with Razor hot reload, and then opens the frontend URL in your default browser. On Windows, if Docker Desktop is installed but not already running, the CLI will try to launch it automatically and wait for the daemon before continuing. The root workflow is HTTPS-first for frontend, backend, Keycloak, and the local Mailpit UI, and it also exports TLS material for the local PostgreSQL container and Mailpit SMTP STARTTLS. It will launch the frontend at `https://localhost:7277`, the backend at `https://localhost:7085`, Keycloak at `https://localhost:8443`, and Mailpit at `https://localhost:8025`, while local PostgreSQL rejects non-TLS TCP connections.
-
-The frontend reconnect modal now retries automatically when the browser tab becomes visible again, when the window regains focus, when the page is restored, and when the client comes back online. If the Blazor circuit cannot be resumed, the page reloads instead of leaving the UI in a dead-click state.
-
-Local registration and verification emails are captured in Mailpit:
-
-```bash
-https://localhost:8025
-```
+This starts local Supabase services, the maintained Workers backend, and the migration SPA, then opens the frontend URL in your default browser.
 
 If you only want to run the frontend from the root workspace:
 
 ```bash
-python ./scripts/dev.py frontend --hot-reload
+python ./scripts/dev.py frontend
 ```
 
-If you want to run API contract tests from the same terminal session without manually keeping the backend open, use:
+If you want to run API contract tests from the same terminal session without manually keeping the Workers stack open, use:
 
 ```bash
-python ./scripts/dev.py api-test --start-backend --skip-lint
+python ./scripts/dev.py api-test --start-workers --skip-lint
 ```
 
-### Run the full local web stack
+### Run the maintained local web stack
 
 ```bash
 python ./scripts/dev.py web
-python ./scripts/dev.py web --hot-reload
 ```
 
-The frontend part of this workflow now runs through `dotnet watch`, so `.razor`, `.cs`, and other supported web-app edits hot reload without restarting the stack. `--hot-reload` also starts live Tailwind rebuilds.
+The maintained frontend part of this workflow runs through the Vite SPA dev server, while the maintained backend runs through Wrangler against local Supabase services.
 
 Useful flags:
 
-- `--hot-reload`
 - `--no-browser`
 - `--skip-backend-restore`
 - `--skip-npm-install`
-- `--skip-css-build`
-- `--skip-frontend-restore`
 - `--backend-url`
 - `--frontend-url`
 
@@ -116,18 +103,18 @@ Use `web-stop` when a previous `web` session was interrupted and left the backen
 python ./scripts/dev.py up --dependencies-only
 ```
 
-### Seed local sample data for Wave 7 UI/UX testing
+### Seed local sample data for the maintained Wave 2 stack
 
 ```bash
-python ./scripts/dev.py seed-data --reset-media
+python ./scripts/dev.py seed-data
 ```
 
 This command:
 
-- ensures local Keycloak + PostgreSQL dependencies are running
-- provisions/updates deterministic local users in Keycloak (including role assignments)
+- ensures local Supabase services are running
+- provisions/updates deterministic local Supabase auth users
 - validates the checked-in title and studio media bundles under `frontend/src/Board.ThirdPartyLibrary.Frontend.Web/wwwroot/test-images/seed-catalog`
-- repopulates local PostgreSQL studio/title/media/release/integration data used by current player/developer/moderation workflows
+- repopulates local Supabase studio/title/media data used by the maintained Workers surface
 - seeds public studio banners plus studio support/social links alongside the studio records
 
 The seed data references those static local asset URLs directly, so rerunning the command refreshes the database state without regenerating art at runtime.
@@ -135,24 +122,120 @@ Title card/hero/logo media should be checked-in PNGs, while studio logos remain 
 
 Useful flags:
 
-- `--reset-media` clears the obsolete legacy generated-media cache before validation
 - `--seed-password`
 
 ### Run the frontend web UI
 
 ```bash
 python ./scripts/dev.py frontend
-python ./scripts/dev.py frontend --hot-reload
 ```
 
-This standalone frontend workflow also uses `dotnet watch` for Razor hot reload.
+This standalone frontend workflow runs the maintained SPA shell through the Vite dev server.
 
 Useful flags:
 
-- `--hot-reload`
 - `--skip-npm-install`
-- `--skip-css-build`
-- `--skip-restore`
+
+## Migration Workflows
+
+Wave 1 and Wave 2 establish the maintained Cloudflare Workers + Supabase backend path and the SPA migration shell.
+
+Reference doc:
+
+- [`docs/cloudflare-supabase-workers-wave-1.md`](./cloudflare-supabase-workers-wave-1.md)
+- [`docs/cloudflare-supabase-workers-wave-2.md`](./cloudflare-supabase-workers-wave-2.md)
+
+### Install, build, or run the React SPA shell
+
+```bash
+python ./scripts/dev.py spa install
+python ./scripts/dev.py spa build
+python ./scripts/dev.py spa run
+```
+
+### Install, build, or run the Workers API shell
+
+```bash
+python ./scripts/dev.py workers install
+python ./scripts/dev.py workers build
+python ./scripts/dev.py workers run
+```
+
+### Start, stop, inspect, or reset local Supabase services
+
+```bash
+python ./scripts/dev.py supabase start
+python ./scripts/dev.py supabase status
+python ./scripts/dev.py supabase db-reset
+python ./scripts/dev.py supabase stop
+```
+
+`supabase db-reset` now reseeds deterministic Supabase auth users, relational demo data, and storage fixtures for the Wave 2 stack.
+
+### Seed only the migration stack
+
+```bash
+python ./scripts/dev.py seed-data
+```
+
+### Run the maintained API contract smoke harness
+
+```bash
+python ./scripts/dev.py contract-smoke --start-workers
+```
+
+This uses the maintained smoke harness under `tests/contract-smoke`.
+
+For local migration runs, the CLI automatically fetches seeded role-appropriate Supabase tokens:
+
+- developer token for player/developer endpoints
+- moderator token for moderation endpoints
+
+Useful migration flags:
+
+- `--start-workers`
+- `--developer-token`
+- `--moderator-token`
+- `--seed-user-email`
+- `--moderator-email`
+- `--seed-user-password`
+
+### Run the Wave 2 Workers flow smoke suite
+
+```bash
+python ./scripts/dev.py workers-smoke --start-stack
+```
+
+This command verifies the local Supabase + Workers stack end to end, including:
+
+- public catalog list/detail
+- current-user bootstrap and profile mutation
+- developer enrollment and studio workspace flows
+- studio link CRUD
+- studio logo upload and retrieval
+- moderation developer verification flows
+
+### Run browser parity smoke and screenshot comparison coverage
+
+```bash
+python ./scripts/dev.py parity-test
+```
+
+This command runs the Playwright-based parity suite under `tests/parity` against an already running reference frontend.
+
+### Refresh the committed screenshot baselines
+
+```bash
+python ./scripts/dev.py capture-parity-baseline
+```
+
+### Run staging deployment wrappers for Pages and Workers
+
+```bash
+python ./scripts/dev.py deploy-staging --dry-run
+python ./scripts/dev.py deploy-staging --pages-only
+python ./scripts/dev.py deploy-staging --workers-only
+```
 
 ### Stop dependencies
 
@@ -180,12 +263,12 @@ python ./scripts/dev.py test --skip-integration
 python ./scripts/dev.py all-tests
 ```
 
-This command runs backend XML docs validation, backend unit/integration tests, frontend tests, OpenAPI lint, and API contract tests in one pass.
+This command runs maintained backend verification, frontend tests, OpenAPI lint, and API contract tests in one pass.
 
-If you are already running the API manually:
+To include the maintained contract run against the local Supabase + Workers stack:
 
 ```bash
-python ./scripts/dev.py all-tests --no-start-backend
+python ./scripts/dev.py all-tests --start-workers
 ```
 
 ### Run the main repository verification workflow
@@ -197,11 +280,10 @@ python ./scripts/dev.py verify --skip-contract-tests
 Include the maintained contract tests in the same pass:
 
 ```bash
-python ./scripts/dev.py verify --start-backend
+python ./scripts/dev.py verify --start-workers
 ```
 
-This workflow validates backend XML docs, runs backend tests, lints the OpenAPI spec, and optionally executes the Postman contract suite.
-It restores the backend solution up front, so it works from a fresh clone without a separate manual `dotnet restore`.
+This workflow validates the maintained backend, lints the OpenAPI spec, and optionally executes the Postman contract suite.
 
 ### Authenticate Postman CLI for workspace or mock operations
 
@@ -217,23 +299,22 @@ If you prefer not to keep a separate login step, `api-mock` and `api-sync` also 
 python ./scripts/dev.py api-lint
 ```
 
-### Run API contract tests against the local backend
+### Run API contract tests against the local Workers stack
 
 ```bash
-python ./scripts/dev.py api-test
+python ./scripts/dev.py api-test --start-workers
 ```
 
 Important for live local runs:
 
-- the committed local environment file contains placeholder values for authenticated and persistence-backed success paths such as `accessToken`, `studioId`, `studioSlug`, `titleId`, and `titleSlug`
-- the committed local environment file also leaves `studioLinkId` as a placeholder for studio-link update/delete flows
-- the collection skips those success-path assertions until you replace the placeholders with real local values
-- health and unauthenticated/public catalog coverage still runs with the committed template as-is
+- the root CLI starts or reuses local Supabase services, reseeds deterministic auth/data/storage fixtures, and starts the Workers API
+- the root CLI resolves seeded developer and moderator access tokens automatically for authenticated contract checks
+- the committed environment template keeps only the maintained Wave 2 variables for the current contract surface
 
-If the backend is not already running, start it automatically for the test run:
+If the Workers API is already running and seeded:
 
 ```bash
-python ./scripts/dev.py api-test --start-backend --skip-lint
+python ./scripts/dev.py api-test --skip-lint
 ```
 
 ### Run API contract tests against a mock URL
@@ -260,58 +341,9 @@ python ./scripts/dev.py api-sync --postman-api-key <your-postman-api-key>
 python ./scripts/dev.py api-sync --skip-mock --postman-api-key <your-postman-api-key>
 ```
 
-## Database Backup and Restore
-
-The CLI includes PostgreSQL helpers that operate against the local Dockerized database container.
-
-### Create a backup (timestamped default path)
-
-```bash
-python ./scripts/dev.py db-backup
-```
-
-Default output location:
-
-- `./backups/<database>-<utc-timestamp>.sql`
-
-### Create a backup at a specific path
-
-```bash
-python ./scripts/dev.py db-backup ./backups/dev-before-migration.sql
-```
-
-### Restore a backup
-
-```bash
-python ./scripts/dev.py db-restore ./backups/dev-before-migration.sql
-```
-
-Notes:
-
-- The PostgreSQL container must already be running (`up` or `up --dependencies-only`).
-- `db-backup` creates a plain SQL dump (`pg_dump`) with cleanup statements (`--clean --if-exists`).
-- `db-restore` replays the SQL using `psql` against the configured database.
-
 ## Configuration Overrides
 
-Most commands accept shared overrides (see `--help` for full details), including:
-
-- `--compose-file`
-- `--postgres-container-name`
-- `--postgres-user`
-- `--postgres-database`
-- `--keycloak-container-name`
-- `--keycloak-ready-url`
-- `--backend-project`
-- `--backend-solution`
-
-Example (non-default DB name):
-
-```bash
-python ./scripts/dev.py status --postgres-database my_local_db
-```
-
-API workflow commands also expose workflow-specific overrides. Common examples:
+Workflow-specific overrides remain available where they still map to the maintained stack. Common examples:
 
 - `api-test --environment <path>`
 - `api-test --base-url <url>`
@@ -319,24 +351,33 @@ API workflow commands also expose workflow-specific overrides. Common examples:
 - `api-lint`
 - `api-mock --mode shared|ephemeral`
 - `api-sync --skip-mock`
-- `web --hot-reload`
+- `web`
 - `web-status`
 - `web-stop --down-dependencies`
-- `frontend --hot-reload`
+- `frontend`
 - `seed-data --seed-password <value>`
+- `spa install|build|run`
+- `workers install|build|run`
+- `supabase start|stop|status|db-reset`
+- `contract-smoke --start-workers`
+- `workers-smoke --start-stack`
+- `parity-test`
+- `capture-parity-baseline`
+- `deploy-staging --dry-run`
 
 For live API contract execution, the default environment template is:
 
-- `api/postman/environments/board-third-party-library_local.postman_environment.json`
+- `api/postman/environments/board-enthusiasts_local.postman_environment.json`
 
-Populate the placeholder auth and resource IDs in a private copy when you want full authenticated create/update coverage against a local backend.
+The root CLI can populate the maintained authenticated contract checks automatically for the local Workers stack by resolving seeded developer and moderator tokens.
 
 ## Notes
 
-- The `up`, `down`, and `status` commands manage the local PostgreSQL, Mailpit, and Keycloak containers together.
-- The `down` command uses `docker compose down` and does **not** remove named volumes. Your local Postgres data persists unless you explicitly remove volumes.
+- The `up`, `down`, and `status` commands now target the maintained local Supabase dependency path.
+- The Wave 1 and Wave 2 migration scaffolding expects `node`, `npm`, `supabase`, and `wrangler`.
 - VS Code tasks in this repo call the Python CLI directly.
 - The supported developer entry point for this repository is `python ./scripts/dev.py ...`; API-local helper scripts under `api/scripts/` are implementation details for CI and the root CLI.
-- Tool executables are resolved from each developer's `PATH`; the CLI does not assume fixed install directories for `dotnet`, `node`, `npx`, `postman`, `docker`, or other required tools.
+- Tool executables are resolved from each developer's `PATH`; the CLI does not assume fixed install directories for `node`, `npx`, `postman`, `supabase`, `wrangler`, `docker`, or other required tools.
+- Migration workspace dependency installs are now cached by lockfile fingerprint so routine Wave 2 commands do not reinstall the entire npm workspace unnecessarily.
 
 
