@@ -4,12 +4,10 @@ A solution for third party developers for the Board ecosystem to use to register
 
 Current implementation status:
 
-- the maintained API/backend/frontend surface includes the Keycloak-backed identity and health foundation, self-service developer access enrollment, verified developer role moderation endpoints, player library and wishlist flows, title reporting with moderator and developer threads, and in-app notifications
-- EF Core migrations for `users`, `user_board_profiles`, `studios`, `studio_memberships`, `studio_links`, `titles`, `title_metadata_versions`, `title_media_assets`, `title_releases`, `release_artifacts`, `supported_publishers`, `integration_connections`, `title_integration_bindings`, `player_owned_titles`, `player_wishlist_entries`, `title_reports`, `title_report_messages`, `user_notifications`, and `user_platform_roles` are implemented
-- Wave 7 delivered the shared workspace shells, in-place developer studio workflows, deterministic local seed data, shared browse/studio catalog UX, and studio public-branding/link management
-- Wave 8 delivered player personalization and moderation follow-up workflows for wishlist, My Games, title reports, and notifications
+- the maintained backend runtime now lives in the [`backend`](backend) submodule as Supabase + Cloudflare Workers
+- the maintained executable API contract now lives in the [`api`](api) submodule and targets the Workers/Supabase surface only
+- the current SPA under [`apps/spa`](apps/spa) is still an in-progress migration shell; Wave 3 remains responsible for the full frontend cutover
 - the current migration wave is Wave 2 platform and API cutover for the Cloudflare, Supabase, and Workers conversion plan
-- the next product wave after the migration branch resumes is Wave 9 unified commerce and entitlements
 
 ## Table of Contents
 
@@ -22,17 +20,16 @@ Current implementation status:
 
 This repository currently tracks backend and frontend as git submodules.
 
-Quick start (full local web stack from the root workspace):
+Quick start (maintained local migration stack from the root workspace):
 
 ```bash
 python ./scripts/dev.py bootstrap
-python ./scripts/dev.py web --hot-reload
+python ./scripts/dev.py web
 ```
 
-This starts local Docker dependencies, the backend API, the frontend web app with Razor hot reload, and opens the frontend URL in your browser.
-On Windows, the CLI will also try to launch Docker Desktop automatically if it is installed but not already running, trust the local .NET HTTPS development certificate, export localhost TLS material for Keycloak and local PostgreSQL, create a local TLS certificate for Mailpit, and launch the local web stack on secure endpoints. The browser-facing services run on HTTPS, local PostgreSQL connections are TLS-enforced, and Keycloak verification emails are captured locally in Mailpit at [`https://localhost:8025`](https://localhost:8025).
+This starts local Supabase services, the maintained Workers backend, and the migration SPA.
 
-Quick start (backend API + local PostgreSQL + Keycloak only):
+Quick start (backend API only):
 
 ```bash
 python ./scripts/dev.py bootstrap
@@ -58,10 +55,7 @@ git submodule status
   - Wave 1 migration foundation: [`docs/cloudflare-supabase-workers-wave-1.md`](docs/cloudflare-supabase-workers-wave-1.md)
   - Wave 2 platform/API cutover: [`docs/cloudflare-supabase-workers-wave-2.md`](docs/cloudflare-supabase-workers-wave-2.md)
 - Backend-specific developer docs (in backend submodule):
-  - Backend phase 1 (PostgreSQL local setup): [`backend/docs/backend-phase-1-postgres-setup.md`](backend/docs/backend-phase-1-postgres-setup.md)
-  - New developer setup / quick start (current backend MVP): [`backend/docs/new-developer-setup.md`](backend/docs/new-developer-setup.md)
-  - Auth and data ownership boundary: [`backend/docs/auth-data-ownership.md`](backend/docs/auth-data-ownership.md)
-  - Current title/catalog schema, lifecycle, media, and release model: [`backend/docs/title-catalog-schema.md`](backend/docs/title-catalog-schema.md)
+  - Backend local runbook: [`backend/docs/workers-backend-local-runbook.md`](backend/docs/workers-backend-local-runbook.md)
 
 ## Planning
 
@@ -90,10 +84,10 @@ Examples:
 ```bash
 python ./scripts/dev.py doctor
 python ./scripts/dev.py bootstrap
-python ./scripts/dev.py web --hot-reload
+python ./scripts/dev.py web
 python ./scripts/dev.py web-status
 python ./scripts/dev.py web-stop --down-dependencies
-python ./scripts/dev.py frontend --hot-reload
+python ./scripts/dev.py frontend
 python ./scripts/dev.py up
 python ./scripts/dev.py all-tests
 python ./scripts/dev.py verify --skip-contract-tests

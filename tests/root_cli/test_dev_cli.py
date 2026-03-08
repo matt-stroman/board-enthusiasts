@@ -52,8 +52,8 @@ class DevCliMigrationHelperTests(unittest.TestCase):
             config = dev.config_from_args(args, repo_root)
 
             self.assertEqual("apps/spa", config.migration_spa_root)
-            self.assertEqual("apps/workers-api", config.migration_workers_root)
-            self.assertEqual("supabase", config.supabase_root)
+            self.assertEqual("backend/apps/workers-api", config.migration_workers_root)
+            self.assertEqual("backend/supabase", config.supabase_root)
 
     def test_build_migration_workspace_command_uses_workspace_name(self) -> None:
         command = dev.build_workspace_npm_command(

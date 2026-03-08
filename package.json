@@ -5,13 +5,14 @@
   "description": "Root migration workspace for the Cloudflare, Supabase, and Workers conversion.",
   "workspaces": [
     "apps/*",
+    "backend/apps/*",
     "packages/*"
   ],
   "scripts": {
     "build:migration": "npm run build --workspace @board-enthusiasts/migration-contract --workspace @board-enthusiasts/workers-api --workspace @board-enthusiasts/spa",
     "lint:migration": "npm run lint --workspace @board-enthusiasts/migration-contract --workspace @board-enthusiasts/workers-api --workspace @board-enthusiasts/spa --if-present",
     "typecheck:migration": "npm run typecheck --workspace @board-enthusiasts/migration-contract --workspace @board-enthusiasts/workers-api --workspace @board-enthusiasts/spa",
-    "seed:migration": "tsx scripts/migration-seed.ts",
+    "seed:migration": "tsx backend/scripts/migration-seed.ts",
     "test:contract-smoke": "tsx tests/contract-smoke/run-contract-smoke.ts",
     "test:workers-smoke": "tsx tests/workers-smoke/run-workers-smoke.ts",
     "test:parity": "playwright test --config tests/parity/playwright.config.ts",

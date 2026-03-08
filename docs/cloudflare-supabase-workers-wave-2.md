@@ -13,7 +13,7 @@ Wave 2 adds:
 - role-aware contract smoke coverage for public, player, developer, and moderation routes
 - end-to-end Workers smoke coverage for auth, catalog, studio CRUD, moderation, and media flows
 
-Wave 2 does not remove the legacy .NET and Keycloak stack yet. That cleanup remains part of Wave 3 cutover.
+Wave 2 now owns the maintained backend runtime in the [`backend`](../backend) submodule. The legacy .NET and Keycloak backend runtime has been removed from the maintained local workflow.
 
 ## Local Commands
 

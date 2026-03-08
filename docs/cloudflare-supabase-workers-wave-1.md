@@ -16,10 +16,10 @@ The current .NET and Docker toolchain remains required for the legacy stack and 
 ## Workspace Layout
 
 - `apps/spa`: React + TypeScript Cloudflare Pages shell
-- `apps/workers-api`: Cloudflare Workers API shell
+- `backend/apps/workers-api`: Cloudflare Workers API shell
 - `packages/migration-contract`: shared maintained route and contract metadata
-- `supabase/`: local Supabase configuration and Wave 1 placeholder seed
-- `cloudflare/`: Pages and Workers config templates
+- `backend/supabase/`: local Supabase configuration and Wave 1 placeholder seed
+- `cloudflare/` and `backend/cloudflare/`: Pages and Workers config templates
 - `config/migration.*.env.example`: local and staging environment layouts
 - `docs/parity/wave-1/`: frozen UX parity reference artifacts
 
@@ -58,9 +58,9 @@ Wave 1 does not commit live provider secrets or live deployment config.
 Committed templates:
 
 - [`cloudflare/pages/wrangler.template.jsonc`](../cloudflare/pages/wrangler.template.jsonc)
-- [`cloudflare/workers/wrangler.template.jsonc`](../cloudflare/workers/wrangler.template.jsonc)
+- [`backend/cloudflare/workers/wrangler.template.jsonc`](../backend/cloudflare/workers/wrangler.template.jsonc)
 - [`config/migration.local.env.example`](../config/migration.local.env.example)
 - [`config/migration.staging.env.example`](../config/migration.staging.env.example)
-- [`supabase/config.toml`](../supabase/config.toml)
+- [`backend/supabase/config.toml`](../backend/supabase/config.toml)
 
 Copy the example env files into ignored local files before real provider wiring.
