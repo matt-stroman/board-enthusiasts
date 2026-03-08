@@ -25,5 +25,7 @@ playwright-report/
 
 # Cloudflare and Supabase local artifacts
 .wrangler/
-supabase/.branches/
-supabase/.temp/
+backend/apps/workers-api/.dev.vars
+backend/apps/workers-api/.wrangler/
+backend/supabase/.branches/
+backend/supabase/.temp/
