@@ -156,6 +156,10 @@ SUPABASE_PROFILE_DESCRIPTIONS: dict[str, str] = {
     SUPABASE_PROFILE_WEB: "database + auth + backend dependencies",
 }
 
+LOCAL_SUPABASE_DB_HOST = "127.0.0.1"
+LOCAL_SUPABASE_DB_PORT = 54322
+LOCAL_SUPABASE_AUTH_URL = "http://127.0.0.1:54321/auth/v1/health"
+
 
 def get_stack_state_path(config: DevConfig, *, stack_name: str) -> Path:
     """Return the on-disk state file used for managed local stack processes.
@@ -1106,6 +1110,97 @@ def show_runtime_status(config: DevConfig, *, expected_profile: str | None = Non
     run_supabase_stack_command(config, action="status")
 
 
+def is_managed_service_running(config: DevConfig, *, stack_name: str, service_key: str) -> bool:
+    """Return whether a tracked managed service process is currently running."""
+
+    state = load_stack_state(config, stack_name=stack_name)
+    if not isinstance(state, dict):
+        return False
+
+    entry = state.get(service_key)
+    if not isinstance(entry, dict):
+        return False
+
+    pid = int(entry.get("pid", 0))
+    return is_process_running(pid)
+
+
+def print_frontend_service_status(config: DevConfig) -> None:
+    """Print status for the maintained frontend service only."""
+
+    state = load_stack_state(config, stack_name="web")
+    if state is None:
+        print("web: not running")
+        return
+
+    entry = state.get("frontend")
+    if not isinstance(entry, dict):
+        print("web: not running")
+        return
+
+    pid = int(entry.get("pid", 0))
+    running = is_process_running(pid)
+    print(f"web: {'running' if running else 'not running'}")
+    if pid > 0:
+        print(f"  pid: {pid}")
+    url = entry.get("url")
+    if isinstance(url, str) and url:
+        print(f"  url: {url}")
+
+
+def print_backend_service_status(config: DevConfig) -> None:
+    """Print status for the maintained backend service only."""
+
+    state = load_stack_state(config, stack_name="api")
+    if state is None:
+        print("api: not running")
+        return
+
+    entry = state.get("backend")
+    if not isinstance(entry, dict):
+        print("api: not running")
+        return
+
+    pid = int(entry.get("pid", 0))
+    running = is_process_running(pid)
+    print(f"api: {'running' if running else 'not running'}")
+    if pid > 0:
+        print(f"  pid: {pid}")
+    url = entry.get("url")
+    if isinstance(url, str) and url:
+        print(f"  url: {url}")
+
+
+def print_auth_service_status() -> None:
+    """Print status for the local auth service only."""
+
+    reachable, detail = probe_http_url(LOCAL_SUPABASE_AUTH_URL)
+    detail_suffix = f" ({detail})" if detail else ""
+    print(f"auth: {'running' if reachable else 'not running'}{detail_suffix}")
+
+
+def print_database_service_status() -> None:
+    """Print status for the local PostgreSQL service only."""
+
+    running = can_connect_to_tcp_port(host=LOCAL_SUPABASE_DB_HOST, port=LOCAL_SUPABASE_DB_PORT)
+    print(f"database: {'running' if running else 'not running'}")
+    if running:
+        print(f"  host: {LOCAL_SUPABASE_DB_HOST}")
+        print(f"  port: {LOCAL_SUPABASE_DB_PORT}")
+
+
+def stop_frontend_service(config: DevConfig) -> bool:
+    """Stop the maintained frontend service only."""
+
+    return stop_managed_stack_processes(config, stack_name="web")
+
+
+def stop_backend_service(config: DevConfig) -> bool:
+    """Stop the maintained backend service only."""
+
+    return stop_managed_stack_processes(config, stack_name="api")
+
+
 def run_full_local_web_stack(
     config: DevConfig,
     *,
@@ -1175,22 +1270,27 @@ def run_full_local_web_stack(
             log_path=frontend_log_path,
         )
 
-        state: dict[str, object] = {
+        frontend_state: dict[str, object] = {
             "started_at_utc": datetime.now(timezone.utc).isoformat(),
-            "backend": {
-                "pid": backend_process.pid,
-                "url": backend_url,
-                "log_path": str(backend_log_path),
-            },
             "frontend": {
                 "pid": frontend_process.pid,
                 "url": frontend_url,
                 "log_path": str(frontend_log_path),
             },
         }
+        backend_state: dict[str, object] = {
+            "started_at_utc": datetime.now(timezone.utc).isoformat(),
+            "backend": {
+                "pid": backend_process.pid,
+                "url": backend_url,
+                "log_path": str(backend_log_path),
+            },
+        }
 
-        state_path = save_stack_state(config, stack_name="web", state=state)
-        print(f"Web stack state: {state_path}")
+        api_state_path = save_stack_state(config, stack_name="api", state=backend_state)
+        web_state_path = save_stack_state(config, stack_name="web", state=frontend_state)
+        print(f"API stack state: {api_state_path}")
+        print(f"Web stack state: {web_state_path}")
 
         if open_browser_on_ready:
             write_step(f"Opening browser to {frontend_url}")
@@ -1214,6 +1314,7 @@ def run_full_local_web_stack(
         print("\nStopping local web stack.")
     finally:
         clear_stack_state(config, stack_name="web")
+        clear_stack_state(config, stack_name="api")
         if frontend_process is not None:
             write_step("Stopping frontend web UI")
             stop_background_process(frontend_process)
@@ -1282,52 +1383,90 @@ def run_local_api_stack(
         clear_runtime_profile_state(config)
 
 
-def show_managed_stack_status(config: DevConfig, *, stack_name: str, label: str) -> None:
-    """Show status for a managed application stack."""
+def show_database_command_status(config: DevConfig, *, include_dependencies: bool) -> None:
+    """Show status for the database command."""
 
-    state = load_stack_state(config, stack_name=stack_name)
-    if state is None:
-        print(f"No active root-managed {label} state file was found.")
-        print(f"Start it with: python ./scripts/dev.py {stack_name}")
-        show_runtime_status(config)
+    del config, include_dependencies
+    print_database_service_status()
+
+
+def show_auth_command_status(config: DevConfig, *, include_dependencies: bool) -> None:
+    """Show status for the auth command."""
+
+    del config
+    print_auth_service_status()
+    if include_dependencies:
+        print_database_service_status()
+
+
+def show_api_command_status(config: DevConfig, *, include_dependencies: bool) -> None:
+    """Show status for the api command."""
+
+    print_backend_service_status(config)
+    if include_dependencies:
+        print_auth_service_status()
+        print_database_service_status()
+
+
+def show_web_command_status(config: DevConfig, *, include_dependencies: bool) -> None:
+    """Show status for the web command."""
+
+    print_frontend_service_status(config)
+    if include_dependencies:
+        print_backend_service_status(config)
+        print_auth_service_status()
+        print_database_service_status()
+
+
+def handle_database_down(config: DevConfig, *, include_dependencies: bool) -> None:
+    """Handle `database down`."""
+
+    del include_dependencies
+    stop_runtime_profile(config)
+    print("Database runtime stopped.")
+
+
+def handle_auth_down(config: DevConfig, *, include_dependencies: bool) -> None:
+    """Handle `auth down`."""
+
+    stop_frontend_service(config)
+    stop_backend_service(config)
+    if include_dependencies:
+        stop_runtime_profile(config)
+        print("Auth runtime and dependencies stopped.")
         return
 
-    print(f"State file: {get_stack_state_path(config, stack_name=stack_name)}")
-    started_at = state.get("started_at_utc")
-    if isinstance(started_at, str) and started_at:
-        print(f"Started at (UTC): {started_at}")
+    restart_runtime_profile(config, profile=SUPABASE_PROFILE_DATABASE)
+    print("Auth runtime stopped. Database remains available.")
 
-    active_count = 0
-    stale_entries: list[str] = []
-    for key in ("backend", "frontend"):
-        entry = state.get(key)
-        if not isinstance(entry, dict):
-            continue
 
-        pid = int(entry.get("pid", 0))
-        running = is_process_running(pid)
-        status = "running" if running else "not running"
-        print(f"{key}: PID {pid} ({status})")
+def handle_api_down(config: DevConfig, *, include_dependencies: bool) -> None:
+    """Handle `api down`."""
 
-        url = entry.get("url")
-        if isinstance(url, str) and url:
-            print(f"  url: {url}")
+    stop_frontend_service(config)
+    stop_backend_service(config)
+    if include_dependencies:
+        stop_runtime_profile(config)
+        print("API runtime and dependencies stopped.")
+        return
 
-        log_path = entry.get("log_path")
-        if isinstance(log_path, str) and log_path:
-            print(f"  log: {log_path}")
+    restart_runtime_profile(config, profile=SUPABASE_PROFILE_AUTH)
+    print("API runtime stopped. Auth and database remain available.")
 
-        if running:
-            active_count += 1
-        else:
-            stale_entries.append(key)
 
-    if active_count == 0:
-        print(f"No tracked {label} processes are still running.")
-        if stale_entries:
-            print(f"The state file is stale. Remove it with: python ./scripts/dev.py {stack_name} down")
+def handle_web_down(config: DevConfig, *, include_dependencies: bool) -> None:
+    """Handle `web down`."""
 
-    show_runtime_status(config)
+    stop_frontend_service(config)
+    if include_dependencies:
+        stop_backend_service(config)
+        stop_runtime_profile(config)
+        print("Web runtime and dependencies stopped.")
+        return
+
+    if is_managed_service_running(config, stack_name="api", service_key="backend"):
+        save_runtime_profile_state(config, profile=SUPABASE_PROFILE_API)
+    print("Web runtime stopped. API, auth, and database remain available.")
 
 
 def start_background_command_with_log(
@@ -3057,6 +3196,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="up",
         help="Database runtime action",
     )
+    database.add_argument(
+        "--include-dependencies",
+        action="store_true",
+        help="Retained for command symmetry; the database profile has no lower-level local dependencies",
+    )
 
     auth = subparsers.add_parser(
         "auth",
@@ -3071,6 +3215,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="up",
         help="Auth runtime action",
     )
+    auth.add_argument(
+        "--include-dependencies",
+        action="store_true",
+        help="Include lower-level dependency handling/status output for the database runtime",
+    )
 
     api = subparsers.add_parser(
         "api",
@@ -3084,6 +3233,11 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         default="up",
         help="API runtime action",
+    )
+    api.add_argument(
+        "--include-dependencies",
+        action="store_true",
+        help="Include auth and database dependency handling/status output",
     )
     api.add_argument(
         "--bootstrap",
@@ -3110,6 +3264,11 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         default="up",
         help="Web runtime action",
+    )
+    web.add_argument(
+        "--include-dependencies",
+        action="store_true",
+        help="Include API, auth, and database dependency handling/status output",
     )
     web.add_argument(
         "--bootstrap",
@@ -3560,18 +3719,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.action == "up":
                 restart_runtime_profile(config, profile=SUPABASE_PROFILE_DATABASE)
             elif args.action == "down":
-                stop_runtime_profile(config)
-                print("Database runtime stopped.")
+                handle_database_down(config, include_dependencies=args.include_dependencies)
             else:
-                show_runtime_status(config, expected_profile=SUPABASE_PROFILE_DATABASE)
+                show_database_command_status(config, include_dependencies=args.include_dependencies)
         elif args.command == "auth":
             if args.action == "up":
                 restart_runtime_profile(config, profile=SUPABASE_PROFILE_AUTH)
             elif args.action == "down":
-                stop_runtime_profile(config)
-                print("Auth runtime stopped.")
+                handle_auth_down(config, include_dependencies=args.include_dependencies)
             else:
-                show_runtime_status(config, expected_profile=SUPABASE_PROFILE_AUTH)
+                show_auth_command_status(config, include_dependencies=args.include_dependencies)
         elif args.command == "api":
             if args.action == "up":
                 run_local_api_stack(
@@ -3580,10 +3737,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     install_dependencies=not args.skip_install,
                 )
             elif args.action == "down":
-                stop_runtime_profile(config)
-                print("API runtime stopped.")
+                handle_api_down(config, include_dependencies=args.include_dependencies)
             else:
-                show_managed_stack_status(config, stack_name="api", label="API stack")
+                show_api_command_status(config, include_dependencies=args.include_dependencies)
         elif args.command == "web":
             if args.action == "up":
                 run_full_local_web_stack(
@@ -3594,10 +3750,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     open_browser_on_ready=not args.no_browser,
                 )
             elif args.action == "down":
-                stop_runtime_profile(config)
-                print("Web runtime stopped.")
+                handle_web_down(config, include_dependencies=args.include_dependencies)
             else:
-                show_managed_stack_status(config, stack_name="web", label="web stack")
+                show_web_command_status(config, include_dependencies=args.include_dependencies)
         elif args.command == "test":
             run_tests(config, run_integration=not args.skip_integration)
         elif args.command == "all-tests":

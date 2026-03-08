@@ -170,6 +170,65 @@ class DevCliMigrationHelperTests(unittest.TestCase):
         self.assertEqual("up", web_args.action)
         self.assertTrue(web_args.hot_reload)
 
+    def test_status_and_down_parsers_accept_include_dependencies(self) -> None:
+        parser = dev.build_parser()
+
+        api_args = parser.parse_args(["api", "down", "--include-dependencies"])
+        web_args = parser.parse_args(["web", "status", "--include-dependencies"])
+
+        self.assertTrue(api_args.include_dependencies)
+        self.assertTrue(web_args.include_dependencies)
+
+    def test_main_web_down_without_dependencies_stops_only_web_service(self) -> None:
+        with (
+            mock.patch.object(dev, "stop_frontend_service") as stop_frontend_service,
+            mock.patch.object(dev, "stop_backend_service") as stop_backend_service,
+            mock.patch.object(dev, "stop_runtime_profile") as stop_runtime_profile,
+            mock.patch.object(dev, "is_managed_service_running", return_value=True),
+            mock.patch.object(dev, "save_runtime_profile_state") as save_runtime_profile_state,
+        ):
+            exit_code = dev.main(["web", "down"])
+
+        self.assertEqual(0, exit_code)
+        stop_frontend_service.assert_called_once()
+        stop_backend_service.assert_not_called()
+        stop_runtime_profile.assert_not_called()
+        save_runtime_profile_state.assert_called_once_with(
+            mock.ANY,
+            profile=dev.SUPABASE_PROFILE_API,
+        )
+
+    def test_main_web_down_with_dependencies_stops_full_stack(self) -> None:
+        with (
+            mock.patch.object(dev, "stop_frontend_service") as stop_frontend_service,
+            mock.patch.object(dev, "stop_backend_service") as stop_backend_service,
+            mock.patch.object(dev, "stop_runtime_profile") as stop_runtime_profile,
+        ):
+            exit_code = dev.main(["web", "down", "--include-dependencies"])
+
+        self.assertEqual(0, exit_code)
+        stop_frontend_service.assert_called_once()
+        stop_backend_service.assert_called_once()
+        stop_runtime_profile.assert_called_once()
+
+    def test_main_api_down_without_dependencies_stops_api_and_keeps_auth_database(self) -> None:
+        with (
+            mock.patch.object(dev, "stop_frontend_service") as stop_frontend_service,
+            mock.patch.object(dev, "stop_backend_service") as stop_backend_service,
+            mock.patch.object(dev, "restart_runtime_profile") as restart_runtime_profile,
+            mock.patch.object(dev, "stop_runtime_profile") as stop_runtime_profile,
+        ):
+            exit_code = dev.main(["api", "down"])
+
+        self.assertEqual(0, exit_code)
+        stop_frontend_service.assert_called_once()
+        stop_backend_service.assert_called_once()
+        restart_runtime_profile.assert_called_once_with(
+            mock.ANY,
+            profile=dev.SUPABASE_PROFILE_AUTH,
+        )
+        stop_runtime_profile.assert_not_called()
+
     def test_run_api_contract_tests_starts_workers_and_injects_seeded_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = pathlib.Path(temp_dir)

@@ -89,9 +89,12 @@ python ./scripts/dev.py database up
 python ./scripts/dev.py auth up
 python ./scripts/dev.py api
 python ./scripts/dev.py api down
+python ./scripts/dev.py api down --include-dependencies
 python ./scripts/dev.py web --hot-reload
 python ./scripts/dev.py web status
+python ./scripts/dev.py web status --include-dependencies
 python ./scripts/dev.py web down
+python ./scripts/dev.py web down --include-dependencies
 python ./scripts/dev.py all-tests
 python ./scripts/dev.py verify --skip-contract-tests
 python ./scripts/dev.py api-lint

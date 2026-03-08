@@ -83,6 +83,8 @@ These map directly to the supported local testing scenarios:
 - `api up|down|status`: PostgreSQL + Supabase Auth + Workers backend
 - `web [up]|down|status`: PostgreSQL + Supabase Auth + Workers backend + SPA
 
+For `down` and `status`, add `--include-dependencies` when you want the command to traverse the dependency chain instead of operating only on the named service.
+
 The maintained frontend runs through the Vite SPA dev server, while the maintained backend runs through Wrangler against local Supabase services.
 
 Useful `web` flags:
@@ -90,6 +92,7 @@ Useful `web` flags:
 - `--no-browser`
 - `--skip-install`
 - `--hot-reload`
+- `--include-dependencies` for `web down` and `web status`
 
 ### Seed local sample data for the maintained stack
 
@@ -138,6 +141,8 @@ python ./scripts/dev.py database status
 python ./scripts/dev.py auth down
 python ./scripts/dev.py api status
 python ./scripts/dev.py web down
+python ./scripts/dev.py api down --include-dependencies
+python ./scripts/dev.py web status --include-dependencies
 ```
 
 Profile notes:
@@ -146,6 +151,9 @@ Profile notes:
 - `auth up` uses a filtered `supabase start -x ...` profile that keeps only the services needed for auth testing.
 - `api` and `web` use filtered Supabase profiles plus the maintained Workers and SPA dev servers.
 - `web --hot-reload` keeps Vite and Wrangler in their watch-based local development mode.
+- `api down` stops the backend service only by default; add `--include-dependencies` to also stop auth and database services.
+- `web down` stops the frontend service only by default; add `--include-dependencies` to also stop API, auth, and database services.
+- `status` reports only the named service by default; add `--include-dependencies` to include dependency status output.
 
 ### Seed only the migration stack
 
@@ -325,6 +333,8 @@ Workflow-specific overrides remain available where they still map to the maintai
 - `auth up|down|status`
 - `api up|down|status`
 - `web [up]|down|status`
+- `api down|status --include-dependencies`
+- `web down|status --include-dependencies`
 - `seed-data --seed-password <value>`
 - `contract-smoke --start-workers`
 - `workers-smoke --start-stack`

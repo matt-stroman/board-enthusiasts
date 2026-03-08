@@ -44,6 +44,8 @@ Helpful notes:
 
 - `database`, `auth`, `api`, and `web` are the maintained local runtime entrypoints after cutover.
 - `web --hot-reload` keeps the Vite SPA and Wrangler backend in their watch-based local development mode.
+- `api down` and `web down` stop only the named service by default; add `--include-dependencies` to also stop lower-level dependencies.
+- `api status` and `web status` report only the named service by default; add `--include-dependencies` to include dependency status output.
 - `seed-data` now reads checked-in media from [`frontend/public/seed-catalog`](../frontend/public/seed-catalog).
 - `verify` now includes maintained frontend tests in addition to backend, root CLI, and API validation.
 
