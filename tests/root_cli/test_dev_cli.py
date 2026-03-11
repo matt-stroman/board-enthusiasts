@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -91,9 +92,9 @@ class DevCliMigrationHelperTests(unittest.TestCase):
                 "-x",
                 "postgrest",
                 "-x",
-                "functions",
+                "edge-runtime",
                 "-x",
-                "analytics",
+                "logflare",
                 "-x",
                 "vector",
                 "-x",
@@ -102,6 +103,61 @@ class DevCliMigrationHelperTests(unittest.TestCase):
             dev.build_supabase_profile_start_command(
                 prefix=prefix,
                 profile=dev.SUPABASE_PROFILE_AUTH,
+            ),
+        )
+        self.assertEqual(
+            [
+                "npx",
+                "supabase",
+                "start",
+                "-x",
+                "studio",
+                "-x",
+                "imgproxy",
+                "-x",
+                "postgres-meta",
+                "-x",
+                "realtime",
+                "-x",
+                "edge-runtime",
+                "-x",
+                "logflare",
+                "-x",
+                "vector",
+                "-x",
+                "supavisor",
+            ],
+            dev.build_supabase_profile_start_command(
+                prefix=prefix,
+                profile=dev.SUPABASE_PROFILE_API,
+            ),
+        )
+
+        self.assertEqual(
+            [
+                "npx",
+                "supabase",
+                "start",
+                "-x",
+                "studio",
+                "-x",
+                "imgproxy",
+                "-x",
+                "postgres-meta",
+                "-x",
+                "realtime",
+                "-x",
+                "edge-runtime",
+                "-x",
+                "logflare",
+                "-x",
+                "vector",
+                "-x",
+                "supavisor",
+            ],
+            dev.build_supabase_profile_start_command(
+                prefix=prefix,
+                profile=dev.SUPABASE_PROFILE_WEB,
             ),
         )
 
@@ -114,12 +170,567 @@ class DevCliMigrationHelperTests(unittest.TestCase):
         self.assertEqual("anon", parsed["ANON_KEY"])
         self.assertEqual("service", parsed["SERVICE_ROLE_KEY"])
 
+    def test_get_supabase_status_env_backfills_current_cli_fields(self) -> None:
+        args = self.create_args()
+        config = dev.config_from_args(args, pathlib.Path.cwd())
+
+        completed = subprocess.CompletedProcess(
+            args=["npx", "supabase", "status", "-o", "env"],
+            returncode=0,
+            stdout=(
+                'ANON_KEY="anon"\n'
+                'PUBLISHABLE_KEY="publishable"\n'
+                'SERVICE_ROLE_KEY="service"\n'
+            ),
+            stderr="",
+        )
+
+        with mock.patch.object(dev, "resolve_supabase_command_prefix", return_value=["npx", "supabase"]), mock.patch.object(
+            dev,
+            "run_command",
+            return_value=completed,
+        ):
+            status_env = dev.get_supabase_status_env(config)
+
+        self.assertEqual(dev.LOCAL_SUPABASE_URL, status_env["API_URL"])
+        self.assertEqual("anon", status_env["ANON_KEY"])
+        self.assertEqual("service", status_env["SERVICE_ROLE_KEY"])
+
+    def test_get_supabase_project_id_reads_config_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            args = self.create_args()
+            config = dev.config_from_args(args, repo_root)
+            supabase_root = repo_root / config.supabase_root
+            supabase_root.mkdir(parents=True, exist_ok=True)
+            (supabase_root / "config.toml").write_text('project_id = "board-enthusiasts-local"\n', encoding="utf-8")
+
+            self.assertEqual("board-enthusiasts-local", dev.get_supabase_project_id(config))
+
     def test_build_supabase_bearer_headers_uses_apikey_and_bearer(self) -> None:
         headers = dev.build_supabase_bearer_headers(api_key="service-role-key")
 
         self.assertEqual("service-role-key", headers["apikey"])
         self.assertEqual("Bearer service-role-key", headers["authorization"])
         self.assertEqual("application/json", headers["accept"])
+
+    def test_ensure_runtime_profile_reuses_matching_runtime_when_supabase_is_healthy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            args = self.create_args()
+            config = dev.config_from_args(args, repo_root)
+
+            runtime_env = {
+                "SUPABASE_URL": "http://127.0.0.1:54321",
+                "SUPABASE_SERVICE_ROLE_KEY": "service-role-key",
+            }
+
+            with (
+                mock.patch.object(dev, "load_runtime_profile_state", return_value=dev.SUPABASE_PROFILE_WEB),
+                mock.patch.object(dev, "stop_all_managed_application_processes") as stop_processes,
+                mock.patch.object(dev, "get_local_supabase_runtime", return_value=runtime_env),
+                mock.patch.object(dev, "wait_for_local_supabase_http_ready") as wait_for_ready,
+                mock.patch.object(dev, "save_runtime_profile_state") as save_state,
+                mock.patch.object(dev, "restart_runtime_profile") as restart_runtime_profile,
+            ):
+                dev.ensure_runtime_profile(config, profile=dev.SUPABASE_PROFILE_WEB)
+
+            stop_processes.assert_called_once_with(config)
+            wait_for_ready.assert_called_once_with(runtime_env=runtime_env)
+            save_state.assert_called_once_with(config, profile=dev.SUPABASE_PROFILE_WEB)
+            restart_runtime_profile.assert_not_called()
+
+    def test_ensure_runtime_profile_reuses_live_web_runtime_without_state_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            args = self.create_args()
+            config = dev.config_from_args(args, repo_root)
+
+            runtime_env = {
+                "SUPABASE_URL": "http://127.0.0.1:54321",
+                "SUPABASE_SERVICE_ROLE_KEY": "service-role-key",
+            }
+
+            with (
+                mock.patch.object(dev, "load_runtime_profile_state", return_value=None),
+                mock.patch.object(dev, "stop_all_managed_application_processes") as stop_processes,
+                mock.patch.object(dev, "get_local_supabase_runtime", return_value=runtime_env),
+                mock.patch.object(dev, "wait_for_local_supabase_http_ready") as wait_for_ready,
+                mock.patch.object(dev, "save_runtime_profile_state") as save_state,
+                mock.patch.object(dev, "restart_runtime_profile") as restart_runtime_profile,
+            ):
+                dev.ensure_runtime_profile(config, profile=dev.SUPABASE_PROFILE_WEB)
+
+            stop_processes.assert_called_once_with(config)
+            wait_for_ready.assert_called_once_with(runtime_env=runtime_env)
+            save_state.assert_called_once_with(config, profile=dev.SUPABASE_PROFILE_WEB)
+            restart_runtime_profile.assert_not_called()
+
+    def test_ensure_runtime_profile_restarts_matching_runtime_when_supabase_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            args = self.create_args()
+            config = dev.config_from_args(args, repo_root)
+
+            with (
+                mock.patch.object(dev, "load_runtime_profile_state", return_value=dev.SUPABASE_PROFILE_WEB),
+                mock.patch.object(dev, "stop_all_managed_application_processes") as stop_processes,
+                mock.patch.object(
+                    dev,
+                    "get_local_supabase_runtime",
+                    side_effect=dev.DevCliError("Local Supabase services are not running."),
+                ),
+                mock.patch.object(dev, "wait_for_local_supabase_http_ready") as wait_for_ready,
+                mock.patch.object(dev, "save_runtime_profile_state") as save_state,
+                mock.patch.object(dev, "restart_runtime_profile") as restart_runtime_profile,
+            ):
+                dev.ensure_runtime_profile(config, profile=dev.SUPABASE_PROFILE_WEB)
+
+            stop_processes.assert_called_once_with(config)
+            wait_for_ready.assert_not_called()
+            save_state.assert_not_called()
+            restart_runtime_profile.assert_called_once_with(config, profile=dev.SUPABASE_PROFILE_WEB)
+
+    def test_ensure_runtime_profile_restarts_when_requested_profile_differs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            args = self.create_args()
+            config = dev.config_from_args(args, repo_root)
+
+            with (
+                mock.patch.object(dev, "load_runtime_profile_state", return_value=dev.SUPABASE_PROFILE_AUTH),
+                mock.patch.object(dev, "stop_all_managed_application_processes") as stop_processes,
+                mock.patch.object(dev, "get_local_supabase_runtime") as get_local_supabase_runtime,
+                mock.patch.object(dev, "wait_for_local_supabase_http_ready") as wait_for_ready,
+                mock.patch.object(dev, "save_runtime_profile_state") as save_state,
+                mock.patch.object(dev, "restart_runtime_profile") as restart_runtime_profile,
+            ):
+                dev.ensure_runtime_profile(config, profile=dev.SUPABASE_PROFILE_WEB)
+
+            stop_processes.assert_not_called()
+            get_local_supabase_runtime.assert_not_called()
+            wait_for_ready.assert_not_called()
+            save_state.assert_not_called()
+            restart_runtime_profile.assert_called_once_with(config, profile=dev.SUPABASE_PROFILE_WEB)
+
+    def test_run_supabase_stop_retries_transient_docker_prune_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            args = self.create_args()
+            config = dev.config_from_args(args, repo_root)
+            (repo_root / config.supabase_root).mkdir(parents=True, exist_ok=True)
+
+            transient_failure = subprocess.CompletedProcess(
+                args=["npx", "supabase", "stop"],
+                returncode=1,
+                stdout="",
+                stderr="failed to prune containers: Error response from daemon: a prune operation is already running",
+            )
+            success = subprocess.CompletedProcess(
+                args=["npx", "supabase", "stop"],
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+
+            with (
+                mock.patch.object(dev, "ensure_migration_workspace_scaffolding"),
+                mock.patch.object(dev, "ensure_docker_daemon_available"),
+                mock.patch.object(dev, "resolve_supabase_command_prefix", return_value=["npx", "supabase"]),
+                mock.patch.object(dev, "run_command", side_effect=[transient_failure, success]) as run_command,
+                mock.patch.object(dev.time, "sleep") as sleep,
+            ):
+                dev.run_supabase_stack_command(config, action="stop")
+
+            self.assertEqual(2, run_command.call_count)
+            sleep.assert_called_once_with(2)
+
+    def test_run_supabase_stop_times_out_and_force_removes_project_containers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            args = self.create_args()
+            config = dev.config_from_args(args, repo_root)
+            (repo_root / config.supabase_root).mkdir(parents=True, exist_ok=True)
+
+            with (
+                mock.patch.object(dev, "ensure_migration_workspace_scaffolding"),
+                mock.patch.object(dev, "ensure_docker_daemon_available"),
+                mock.patch.object(dev, "resolve_supabase_command_prefix", return_value=["npx", "supabase"]),
+                mock.patch.object(
+                    dev,
+                    "run_command",
+                    side_effect=subprocess.TimeoutExpired(cmd=["npx", "supabase", "stop"], timeout=dev.SUPABASE_STOP_TIMEOUT_SECONDS),
+                ) as run_command,
+                mock.patch.object(dev, "force_remove_supabase_project_containers", return_value=True) as force_remove,
+            ):
+                dev.run_supabase_stack_command(config, action="stop")
+
+            run_command.assert_called_once_with(
+                ["npx", "supabase", "stop"],
+                cwd=repo_root / config.supabase_root,
+                check=False,
+                capture_output=True,
+                timeout_seconds=dev.SUPABASE_STOP_TIMEOUT_SECONDS,
+            )
+            force_remove.assert_called_once_with(config)
+
+    def test_run_supabase_stop_treats_unreachable_docker_as_already_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            args = self.create_args()
+            config = dev.config_from_args(args, repo_root)
+            (repo_root / config.supabase_root).mkdir(parents=True, exist_ok=True)
+
+            with (
+                mock.patch.object(dev, "ensure_migration_workspace_scaffolding"),
+                mock.patch.object(dev, "ensure_docker_daemon_available", side_effect=dev.DevCliError("docker unavailable")),
+                mock.patch.object(dev, "resolve_supabase_command_prefix", return_value=["npx", "supabase"]),
+                mock.patch.object(dev, "run_command") as run_command,
+            ):
+                dev.run_supabase_stack_command(config, action="stop")
+
+            run_command.assert_not_called()
+
+    def test_run_supabase_start_removes_stale_conflicting_containers_and_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            args = self.create_args()
+            config = dev.config_from_args(args, repo_root)
+            supabase_root = repo_root / config.supabase_root
+            supabase_root.mkdir(parents=True, exist_ok=True)
+            (supabase_root / "config.toml").write_text('project_id = "board-enthusiasts-local"\n', encoding="utf-8")
+
+            conflict = subprocess.CompletedProcess(
+                args=["npx", "supabase", "start"],
+                returncode=1,
+                stdout="",
+                stderr='failed to create docker container: Error response from daemon: Conflict. The container name "/supabase_vector_board-enthusiasts-local" is already in use',
+            )
+            success = subprocess.CompletedProcess(
+                args=["npx", "supabase", "start"],
+                returncode=0,
+                stdout="Started supabase local development setup.",
+                stderr="",
+            )
+
+            with (
+                mock.patch.object(dev, "ensure_migration_workspace_scaffolding"),
+                mock.patch.object(dev, "ensure_docker_daemon_available"),
+                mock.patch.object(dev, "resolve_supabase_command_prefix", return_value=["npx", "supabase"]),
+                mock.patch.object(dev, "remove_stale_supabase_project_containers") as remove_stale,
+                mock.patch.object(dev, "run_command", side_effect=[conflict, success]) as run_command,
+                mock.patch.object(
+                    dev,
+                    "get_local_supabase_runtime",
+                    return_value={
+                        "SUPABASE_URL": "http://127.0.0.1:54321",
+                        "SUPABASE_SERVICE_ROLE_KEY": "service-role-key",
+                    },
+                ),
+                mock.patch.object(dev, "wait_for_local_supabase_http_ready"),
+            ):
+                dev.run_supabase_stack_command(config, action="start")
+
+            self.assertEqual(2, run_command.call_count)
+            remove_stale.assert_called_once_with(config)
+
+    def test_run_supabase_start_treats_already_starting_stack_as_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            args = self.create_args()
+            config = dev.config_from_args(args, repo_root)
+            supabase_root = repo_root / config.supabase_root
+            supabase_root.mkdir(parents=True, exist_ok=True)
+
+            already_starting = subprocess.CompletedProcess(
+                args=["npx", "supabase", "start"],
+                returncode=1,
+                stdout="supabase start is already running.",
+                stderr="supabase_db_board-enthusiasts-local container is not ready: starting",
+            )
+
+            with (
+                mock.patch.object(dev, "ensure_migration_workspace_scaffolding"),
+                mock.patch.object(dev, "ensure_docker_daemon_available"),
+                mock.patch.object(dev, "resolve_supabase_command_prefix", return_value=["npx", "supabase"]),
+                mock.patch.object(dev, "run_command", return_value=already_starting) as run_command,
+                mock.patch.object(
+                    dev,
+                    "get_local_supabase_runtime",
+                    return_value={
+                        "SUPABASE_URL": "http://127.0.0.1:54321",
+                        "SUPABASE_SERVICE_ROLE_KEY": "service-role-key",
+                    },
+                ),
+                mock.patch.object(dev, "wait_for_local_supabase_http_ready") as wait_for_ready,
+            ):
+                dev.run_supabase_stack_command(config, action="start")
+
+            run_command.assert_called_once()
+            wait_for_ready.assert_called_once()
+
+    def test_run_supabase_start_uses_maintained_web_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            args = self.create_args()
+            config = dev.config_from_args(args, repo_root)
+            supabase_root = repo_root / config.supabase_root
+            supabase_root.mkdir(parents=True, exist_ok=True)
+
+            success = subprocess.CompletedProcess(
+                args=["npx", "supabase", "start"],
+                returncode=0,
+                stdout="Started supabase local development setup.",
+                stderr="",
+            )
+
+            with (
+                mock.patch.object(dev, "ensure_migration_workspace_scaffolding"),
+                mock.patch.object(dev, "ensure_docker_daemon_available"),
+                mock.patch.object(dev, "resolve_supabase_command_prefix", return_value=["npx", "supabase"]),
+                mock.patch.object(dev, "run_command", return_value=success) as run_command,
+                mock.patch.object(
+                    dev,
+                    "get_local_supabase_runtime",
+                    return_value={
+                        "SUPABASE_URL": "http://127.0.0.1:54321",
+                        "SUPABASE_SERVICE_ROLE_KEY": "service-role-key",
+                    },
+                ),
+                mock.patch.object(dev, "wait_for_local_supabase_http_ready"),
+            ):
+                dev.run_supabase_stack_command(config, action="start")
+
+            run_command.assert_called_once_with(
+                dev.build_supabase_profile_start_command(
+                    prefix=["npx", "supabase"],
+                    profile=dev.SUPABASE_PROFILE_WEB,
+                ),
+                cwd=supabase_root,
+                check=False,
+                capture_output=True,
+            )
+
+    def test_run_supabase_start_retries_when_docker_is_still_reconciling_containers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            args = self.create_args()
+            config = dev.config_from_args(args, repo_root)
+            supabase_root = repo_root / config.supabase_root
+            supabase_root.mkdir(parents=True, exist_ok=True)
+
+            transient_failure = subprocess.CompletedProcess(
+                args=["npx", "supabase", "start"],
+                returncode=1,
+                stdout="",
+                stderr=(
+                    "Stopping containers...\n"
+                    "failed to prune containers: Error response from daemon: a prune operation is already running\n"
+                    "failed to start docker container: Error response from daemon: No such container: deadbeef"
+                ),
+            )
+            success = subprocess.CompletedProcess(
+                args=["npx", "supabase", "start"],
+                returncode=0,
+                stdout="Started supabase local development setup.",
+                stderr="",
+            )
+
+            with (
+                mock.patch.object(dev, "ensure_migration_workspace_scaffolding"),
+                mock.patch.object(dev, "ensure_docker_daemon_available"),
+                mock.patch.object(dev, "resolve_supabase_command_prefix", return_value=["npx", "supabase"]),
+                mock.patch.object(dev, "run_command", side_effect=[transient_failure, success]) as run_command,
+                mock.patch.object(
+                    dev,
+                    "get_local_supabase_runtime",
+                    return_value={
+                        "SUPABASE_URL": "http://127.0.0.1:54321",
+                        "SUPABASE_SERVICE_ROLE_KEY": "service-role-key",
+                    },
+                ),
+                mock.patch.object(dev, "wait_for_local_supabase_http_ready"),
+            ):
+                dev.run_supabase_stack_command(config, action="start")
+
+            self.assertEqual(2, run_command.call_count)
+
+    def test_run_supabase_db_reset_retries_when_container_removal_is_still_in_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            args = self.create_args()
+            config = dev.config_from_args(args, repo_root)
+            supabase_root = repo_root / config.supabase_root
+            supabase_root.mkdir(parents=True, exist_ok=True)
+
+            retryable_failure = subprocess.CompletedProcess(
+                args=["npx", "supabase", "db", "reset", "--local"],
+                returncode=1,
+                stdout="",
+                stderr=(
+                    "Resetting local database...\n"
+                    "failed to remove container: Error response from daemon: "
+                    "removal of container supabase_db_board-enthusiasts-local is already in progress"
+                ),
+            )
+            success = subprocess.CompletedProcess(
+                args=["npx", "supabase", "db", "reset", "--local"],
+                returncode=0,
+                stdout="Reset complete.",
+                stderr="",
+            )
+            start_success = subprocess.CompletedProcess(
+                args=["npx", "supabase", "start"],
+                returncode=0,
+                stdout="Started supabase local development setup.",
+                stderr="",
+            )
+
+            with (
+                mock.patch.object(dev, "ensure_migration_workspace_scaffolding"),
+                mock.patch.object(dev, "ensure_docker_daemon_available"),
+                mock.patch.object(dev, "install_migration_workspace_dependencies"),
+                mock.patch.object(dev, "resolve_supabase_command_prefix", return_value=["npx", "supabase"]),
+                mock.patch.object(dev, "run_command", side_effect=[retryable_failure, start_success, success]) as run_command,
+                mock.patch.object(dev, "seed_migration_data") as seed_migration_data,
+                mock.patch.object(
+                    dev,
+                    "get_local_supabase_runtime",
+                    return_value={
+                        "SUPABASE_URL": "http://127.0.0.1:54321",
+                        "SUPABASE_SERVICE_ROLE_KEY": "service-role-key",
+                    },
+                ),
+                mock.patch.object(dev, "wait_for_local_supabase_http_ready"),
+            ):
+                dev.run_supabase_stack_command(config, action="db-reset")
+
+            self.assertEqual(3, run_command.call_count)
+            seed_migration_data.assert_called_once_with(config, seed_password=dev.LOCAL_SEED_DEFAULT_PASSWORD)
+
+    def test_run_supabase_db_reset_retries_when_migration_state_is_inconsistent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            args = self.create_args()
+            config = dev.config_from_args(args, repo_root)
+            supabase_root = repo_root / config.supabase_root
+            supabase_root.mkdir(parents=True, exist_ok=True)
+
+            migration_conflict = subprocess.CompletedProcess(
+                args=["npx", "supabase", "db", "reset", "--local"],
+                returncode=1,
+                stdout="",
+                stderr=(
+                    "ERROR: duplicate key value violates unique constraint \"schema_migrations_pkey\" "
+                    "(SQLSTATE 23505)"
+                ),
+            )
+            success = subprocess.CompletedProcess(
+                args=["npx", "supabase", "db", "reset", "--local"],
+                returncode=0,
+                stdout="Reset complete.",
+                stderr="",
+            )
+            stop_success = subprocess.CompletedProcess(
+                args=["npx", "supabase", "stop"],
+                returncode=0,
+                stdout="Stopped local Supabase services.",
+                stderr="",
+            )
+            start_success = subprocess.CompletedProcess(
+                args=["npx", "supabase", "start"],
+                returncode=0,
+                stdout="Started supabase local development setup.",
+                stderr="",
+            )
+
+            with (
+                mock.patch.object(dev, "ensure_migration_workspace_scaffolding"),
+                mock.patch.object(dev, "ensure_docker_daemon_available"),
+                mock.patch.object(dev, "install_migration_workspace_dependencies"),
+                mock.patch.object(dev, "resolve_supabase_command_prefix", return_value=["npx", "supabase"]),
+                mock.patch.object(
+                    dev,
+                    "run_command",
+                    side_effect=[migration_conflict, stop_success, start_success, success],
+                ) as run_command,
+                mock.patch.object(dev, "seed_migration_data") as seed_migration_data,
+                mock.patch.object(
+                    dev,
+                    "get_local_supabase_runtime",
+                    return_value={
+                        "SUPABASE_URL": "http://127.0.0.1:54321",
+                        "SUPABASE_SERVICE_ROLE_KEY": "service-role-key",
+                    },
+                ),
+                mock.patch.object(dev, "wait_for_local_supabase_http_ready"),
+            ):
+                dev.run_supabase_stack_command(config, action="db-reset")
+
+            self.assertEqual(4, run_command.call_count)
+            seed_migration_data.assert_called_once_with(config, seed_password=dev.LOCAL_SEED_DEFAULT_PASSWORD)
+
+    def test_run_supabase_db_reset_restarts_stack_when_seed_readiness_is_transient(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            args = self.create_args()
+            config = dev.config_from_args(args, repo_root)
+            supabase_root = repo_root / config.supabase_root
+            supabase_root.mkdir(parents=True, exist_ok=True)
+
+            success = subprocess.CompletedProcess(
+                args=["npx", "supabase", "db", "reset", "--local"],
+                returncode=0,
+                stdout="Reset complete.",
+                stderr="",
+            )
+            stop_success = subprocess.CompletedProcess(
+                args=["npx", "supabase", "stop"],
+                returncode=0,
+                stdout="Stopped local Supabase services.",
+                stderr="",
+            )
+            start_success = subprocess.CompletedProcess(
+                args=["npx", "supabase", "start"],
+                returncode=0,
+                stdout="Started supabase local development setup.",
+                stderr="",
+            )
+            transient_seed_error = dev.DevCliError(
+                "Timed out waiting for local Supabase HTTP services to become ready.\n"
+                "Last probe failures: Supabase Storage API: HTTP 502 Bad Gateway: "
+                '{"message":"An invalid response was received from the upstream server"}'
+            )
+
+            with (
+                mock.patch.object(dev, "ensure_migration_workspace_scaffolding"),
+                mock.patch.object(dev, "ensure_docker_daemon_available"),
+                mock.patch.object(dev, "install_migration_workspace_dependencies"),
+                mock.patch.object(dev, "resolve_supabase_command_prefix", return_value=["npx", "supabase"]),
+                mock.patch.object(
+                    dev,
+                    "run_command",
+                    side_effect=[success, stop_success, start_success, success],
+                ) as run_command,
+                mock.patch.object(
+                    dev,
+                    "seed_migration_data",
+                    side_effect=[transient_seed_error, None],
+                ) as seed_migration_data,
+                mock.patch.object(
+                    dev,
+                    "get_local_supabase_runtime",
+                    return_value={
+                        "SUPABASE_URL": "http://127.0.0.1:54321",
+                        "SUPABASE_SERVICE_ROLE_KEY": "service-role-key",
+                    },
+                ),
+                mock.patch.object(dev, "wait_for_local_supabase_http_ready"),
+            ):
+                dev.run_supabase_stack_command(config, action="db-reset")
+
+            self.assertEqual(4, run_command.call_count)
+            self.assertEqual(2, seed_migration_data.call_count)
 
     def test_has_current_migration_workspace_dependencies_tracks_lockfile_fingerprint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -229,6 +840,19 @@ class DevCliMigrationHelperTests(unittest.TestCase):
         )
         stop_runtime_profile.assert_not_called()
 
+    def test_main_seed_data_uses_start_and_db_reset_workflow(self) -> None:
+        with mock.patch.object(dev, "run_supabase_stack_command") as run_supabase_stack_command:
+            exit_code = dev.main(["seed-data"])
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual(
+            [
+                mock.call(mock.ANY, action="start"),
+                mock.call(mock.ANY, action="db-reset"),
+            ],
+            run_supabase_stack_command.call_args_list,
+        )
+
     def test_run_api_contract_tests_starts_workers_and_injects_seeded_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = pathlib.Path(temp_dir)
@@ -324,6 +948,30 @@ class DevCliMigrationHelperTests(unittest.TestCase):
         ):
             with self.assertRaises(SystemExit):
                 parser.parse_args(command)
+
+    def test_api_lint_tolerates_known_redocly_windows_shutdown_assertion_after_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            args = self.create_args()
+            config = dev.config_from_args(args, repo_root)
+            spec_path = repo_root / config.api_spec
+            spec_path.parent.mkdir(parents=True, exist_ok=True)
+            spec_path.write_text("openapi: 3.1.0\ninfo:\n  title: Test\n  version: 1.0.0\npaths: {}\n", encoding="utf-8")
+
+            result = subprocess.CompletedProcess(
+                args=["npx", "@redocly/cli", "lint", str(spec_path)],
+                returncode=1,
+                stdout="Woohoo! Your API description is valid. 🎉",
+                stderr="Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\\win\\async.c, line 76",
+            )
+
+            with (
+                mock.patch.object(dev, "assert_command_available"),
+                mock.patch.object(dev, "run_command", return_value=result) as run_command,
+            ):
+                dev.run_api_spec_lint(config)
+
+            self.assertTrue(run_command.called)
 
 
 if __name__ == "__main__":

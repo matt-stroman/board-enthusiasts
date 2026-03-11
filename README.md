@@ -27,6 +27,9 @@ python ./scripts/dev.py web --hot-reload
 ```
 
 This starts local Supabase services, the maintained Workers backend, and the SPA.
+If the local Supabase volume is empty, the `api` and `web` entrypoints automatically seed the deterministic demo catalog before the backend starts.
+If the running local Supabase schema is missing required checked-in tables from newer migrations, `api` and `web` automatically reset the local database and reseed before continuing.
+Run `python ./scripts/dev.py seed-data` whenever you want to refresh the full checked-in local demo catalog fixture set after seed changes.
 
 Quick start (backend API only):
 

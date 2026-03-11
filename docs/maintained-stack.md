@@ -21,6 +21,8 @@ That starts:
 - the Workers API
 - the Vite SPA dev server
 
+If the local Supabase volume is empty, the `api` and `web` entrypoints auto-seed the deterministic demo catalog before the Workers API starts.
+
 Other maintained runtime entrypoints:
 
 ```bash
@@ -36,6 +38,9 @@ Useful notes:
 
 - `database`, `auth`, `api`, and `web` are the supported local runtime profiles.
 - `web --hot-reload` keeps the SPA and Workers API in watch-mode development.
+- `api` and `web` automatically seed deterministic demo data when the local Supabase stack has no catalog rows yet.
+- `seed-data` refreshes the full checked-in local demo catalog fixture set, including the broader browse/studio sample surface.
+- the maintained seed roster includes 24 local users, including player-heavy coverage plus developer, moderator, admin, and super-admin accounts.
 - `api down` and `web down` stop only the named service by default; add `--include-dependencies` to stop lower-level services as well.
 - `api status` and `web status` report only the named service by default; add `--include-dependencies` to include dependencies.
 
@@ -49,6 +54,13 @@ The maintained application surface includes:
 - developer studio CRUD, studio link CRUD, and studio media uploads
 - moderation developer verification
 
+## Credential Handling
+
+- The maintained sign-in, registration, confirmation, and password-recovery forms submit credentials directly from the browser to Supabase Auth through [`@supabase/supabase-js`](../frontend/src/auth.tsx).
+- User passwords are not sent to the maintained Workers API routes, are not stored in the application database, and are not re-emitted by the frontend API helpers.
+- The SPA runtime now rejects non-HTTPS hosted values for `VITE_SUPABASE_URL` and `VITE_API_BASE_URL`; only local loopback `http://localhost`, `http://127.0.0.1`, and `http://[::1]` endpoints are allowed for local development.
+- This stack intentionally does not add client-side password hashing on top of Supabase Auth. Without a challenge-based protocol, that would only replace the password with another replayable secret. Transport confidentiality is provided by HTTPS in hosted environments.
+
 ## Validation
 
 Primary validation paths:
@@ -59,3 +71,5 @@ python ./scripts/dev.py contract-smoke --start-workers
 python ./scripts/dev.py workers-smoke --start-stack
 python ./scripts/dev.py parity-test
 ```
+
+`all-tests` and `verify` both include the maintained workspace-wide TypeScript typecheck so contract, Workers, and SPA packages are checked together before the rest of the validation flow runs.

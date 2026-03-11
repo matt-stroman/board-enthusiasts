@@ -24,6 +24,7 @@ import http.client
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -122,8 +123,8 @@ SUPABASE_PROFILE_EXCLUDES: dict[str, tuple[str, ...]] = {
         "postgres-meta",
         "realtime",
         "postgrest",
-        "functions",
-        "analytics",
+        "edge-runtime",
+        "logflare",
         "vector",
         "supavisor",
     ),
@@ -132,8 +133,8 @@ SUPABASE_PROFILE_EXCLUDES: dict[str, tuple[str, ...]] = {
         "imgproxy",
         "postgres-meta",
         "realtime",
-        "functions",
-        "analytics",
+        "edge-runtime",
+        "logflare",
         "vector",
         "supavisor",
     ),
@@ -142,8 +143,8 @@ SUPABASE_PROFILE_EXCLUDES: dict[str, tuple[str, ...]] = {
         "imgproxy",
         "postgres-meta",
         "realtime",
-        "functions",
-        "analytics",
+        "edge-runtime",
+        "logflare",
         "vector",
         "supavisor",
     ),
@@ -158,7 +159,9 @@ SUPABASE_PROFILE_DESCRIPTIONS: dict[str, str] = {
 
 LOCAL_SUPABASE_DB_HOST = "127.0.0.1"
 LOCAL_SUPABASE_DB_PORT = 54322
+LOCAL_SUPABASE_URL = "http://127.0.0.1:54321"
 LOCAL_SUPABASE_AUTH_URL = "http://127.0.0.1:54321/auth/v1/health"
+SUPABASE_STOP_TIMEOUT_SECONDS = 30
 
 
 def get_stack_state_path(config: DevConfig, *, stack_name: str) -> Path:
@@ -194,6 +197,20 @@ def write_step(message: str) -> None:
     print(f"==> {message}")
 
 
+def print_console_text(text: str) -> None:
+    """Print text while tolerating Windows console encoding limitations."""
+
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        if hasattr(sys.stdout, "buffer"):
+            sys.stdout.buffer.write(text.encode(sys.stdout.encoding or "utf-8", errors="replace"))
+            sys.stdout.buffer.write(b"\n")
+            sys.stdout.buffer.flush()
+        else:
+            print(text.encode("utf-8", errors="replace").decode("utf-8"))
+
+
 def quote_cmd(parts: Sequence[str]) -> str:
     """Render a subprocess command as a shell-like string for error messages.
 
@@ -218,6 +235,7 @@ def run_command(
     stdout=None,
     stderr=None,
     env: dict[str, str] | None = None,
+    timeout_seconds: float | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a subprocess command with consistent error handling.
 
@@ -231,6 +249,7 @@ def run_command(
         stdout: Optional stdout destination override.
         stderr: Optional stderr destination override.
         env: Optional environment variables for the subprocess.
+        timeout_seconds: Optional timeout applied to the subprocess execution.
 
     Returns:
         The completed subprocess result.
@@ -258,6 +277,7 @@ def run_command(
         stdout=stdout,
         stderr=stderr,
         env=env,
+        timeout=timeout_seconds,
     )
     if check and result.returncode != 0:
         raise DevCliError(f"Command failed ({result.returncode}): {quote_cmd(resolved_cmd)}")
@@ -1087,6 +1107,31 @@ def restart_runtime_profile(config: DevConfig, *, profile: str) -> None:
     start_runtime_profile(config, profile=profile)
 
 
+def ensure_runtime_profile(config: DevConfig, *, profile: str) -> None:
+    """Ensure the maintained local runtime matches the supplied profile."""
+
+    active_profile = load_runtime_profile_state(config)
+    reusable_profiles = {profile}
+    if profile in (SUPABASE_PROFILE_API, SUPABASE_PROFILE_WEB):
+        reusable_profiles = {SUPABASE_PROFILE_API, SUPABASE_PROFILE_WEB, None}
+
+    if active_profile not in reusable_profiles:
+        restart_runtime_profile(config, profile=profile)
+        return
+
+    write_step(f"Reusing local {SUPABASE_PROFILE_DESCRIPTIONS[profile]} runtime")
+    stop_all_managed_application_processes(config)
+    try:
+        runtime_env = get_local_supabase_runtime(config)
+        wait_for_local_supabase_http_ready(runtime_env=runtime_env)
+    except DevCliError:
+        print("Existing local runtime was unavailable; restarting local services.")
+        restart_runtime_profile(config, profile=profile)
+        return
+
+    save_runtime_profile_state(config, profile=profile)
+
+
 def stop_runtime_profile(config: DevConfig) -> None:
     """Stop the maintained local runtime profile and clear tracked process state."""
 
@@ -1238,7 +1283,7 @@ def run_full_local_web_stack(
     if hot_reload:
         print("Hot reload enabled via Vite and Wrangler dev mode.")
 
-    restart_runtime_profile(config, profile=SUPABASE_PROFILE_WEB)
+    ensure_runtime_profile(config, profile=SUPABASE_PROFILE_WEB)
 
     backend_process: subprocess.Popen | None = None
     frontend_process: subprocess.Popen | None = None
@@ -1250,6 +1295,7 @@ def run_full_local_web_stack(
         ensure_local_url_port_available(url=frontend_url, description="frontend web UI")
 
         runtime_env = get_local_supabase_runtime(config)
+        ensure_local_demo_seed_data(config, runtime_env=runtime_env)
 
         write_step("Starting maintained backend API in the background")
         backend_process, backend_log_path = start_migration_workers_process(config, runtime_env=runtime_env)
@@ -1343,7 +1389,7 @@ def run_local_api_stack(
     if install_dependencies:
         install_migration_workspace_dependencies(config)
 
-    restart_runtime_profile(config, profile=SUPABASE_PROFILE_API)
+    ensure_runtime_profile(config, profile=SUPABASE_PROFILE_API)
 
     backend_process: subprocess.Popen | None = None
     backend_log_path: Path | None = None
@@ -1351,6 +1397,7 @@ def run_local_api_stack(
     try:
         ensure_local_url_port_available(url=backend_url, description="backend API")
         runtime_env = get_local_supabase_runtime(config)
+        ensure_local_demo_seed_data(config, runtime_env=runtime_env)
 
         write_step("Starting maintained backend API in the background")
         backend_process, backend_log_path = start_migration_workers_process(config, runtime_env=runtime_env)
@@ -1567,6 +1614,26 @@ def run_frontend_tests(config: DevConfig, *, restore: bool = True) -> None:
     run_command(build_workspace_npm_command(script_name="test", workspace_name=config.migration_spa_workspace_name), cwd=config.repo_root)
 
 
+def run_migration_typecheck(config: DevConfig, *, restore: bool = True) -> None:
+    """Run the maintained workspace-wide TypeScript typecheck.
+
+    Args:
+        config: CLI configuration containing the root workspace path.
+        restore: Whether to install root npm workspace dependencies before running typecheck.
+
+    Returns:
+        None.
+    """
+
+    assert_command_available("npm")
+    ensure_migration_workspace_scaffolding(config)
+    if restore:
+        install_migration_workspace_dependencies(config)
+
+    write_step("Running maintained workspace typecheck")
+    run_command(["npm", "run", "typecheck:migration"], cwd=config.repo_root)
+
+
 def build_subprocess_env(*, extra: dict[str, str] | None = None) -> dict[str, str]:
     """Build a subprocess environment, optionally overlaying additional variables.
 
@@ -1599,6 +1666,7 @@ def build_migration_frontend_environment(config: DevConfig, *, runtime_env: dict
             "VITE_API_BASE_URL": config.migration_workers_base_url,
             "VITE_SUPABASE_URL": runtime_env["SUPABASE_URL"],
             "VITE_SUPABASE_ANON_KEY": runtime_env["SUPABASE_ANON_KEY"],
+            "VITE_TURNSTILE_SITE_KEY": os.environ.get("VITE_TURNSTILE_SITE_KEY", ""),
         }
     )
 
@@ -1908,14 +1976,20 @@ def get_supabase_status_env(config: DevConfig) -> dict[str, str]:
         raise DevCliError("Supabase status command failed." + (f"\n{output}" if output else ""))
 
     parsed = parse_env_assignments(result.stdout or "")
+    normalized = dict(parsed)
+    if not normalized.get("API_URL"):
+        normalized["API_URL"] = LOCAL_SUPABASE_URL
+    if not normalized.get("ANON_KEY") and normalized.get("PUBLISHABLE_KEY"):
+        normalized["ANON_KEY"] = normalized["PUBLISHABLE_KEY"]
+
     required = ("API_URL", "ANON_KEY", "SERVICE_ROLE_KEY")
-    missing = [name for name in required if not parsed.get(name)]
+    missing = [name for name in required if not normalized.get(name)]
     if missing:
         raise DevCliError(
             "Supabase status output did not include the expected runtime keys: "
             + ", ".join(missing)
         )
-    return parsed
+    return normalized
 
 
 def get_local_supabase_runtime(config: DevConfig) -> dict[str, str]:
@@ -2007,7 +2081,7 @@ def probe_http_endpoint(
 def wait_for_local_supabase_http_ready(
     *,
     runtime_env: dict[str, str],
-    timeout_seconds: int = 120,
+    timeout_seconds: int = 180,
 ) -> None:
     """Wait until the core local Supabase REST and storage endpoints are ready.
 
@@ -2025,6 +2099,11 @@ def wait_for_local_supabase_http_ready(
     service_headers = build_supabase_bearer_headers(api_key=runtime_env["SUPABASE_SERVICE_ROLE_KEY"])
     base_url = runtime_env["SUPABASE_URL"].rstrip("/")
     checks = (
+        (
+            "Supabase Auth API",
+            f"{base_url}/auth/v1/health",
+            None,
+        ),
         (
             "Supabase REST API",
             f"{base_url}/rest/v1/migration_wave_state?select=key&limit=1",
@@ -2061,6 +2140,125 @@ def wait_for_local_supabase_http_ready(
     )
 
 
+def is_transient_supabase_seed_readiness_failure(error: DevCliError) -> bool:
+    """Return whether a local seed failure looks like a transient Supabase restart issue."""
+
+    message = str(error).lower()
+    return (
+        "timed out waiting for local supabase http services to become ready" in message
+        and (
+            "supabase storage api" in message
+            or "invalid response was received from the upstream server" in message
+            or "connection refused" in message
+        )
+    )
+
+
+def is_local_supabase_not_running_error(error: DevCliError) -> bool:
+    """Return whether a local seed failure indicates the Supabase stack is currently down."""
+
+    return "local supabase services are not running" in str(error).lower()
+
+
+def is_partial_local_supabase_runtime_error(error: DevCliError) -> bool:
+    """Return whether a local Supabase runtime probe found only a partial service profile."""
+
+    return "supabase status output did not include the expected runtime keys" in str(error).lower()
+
+
+def has_local_demo_seed_data(*, runtime_env: dict[str, str]) -> bool:
+    """Return whether the local Supabase stack already contains demo catalog data.
+
+    Args:
+        runtime_env: Resolved local Supabase runtime values.
+
+    Returns:
+        ``True`` when at least one catalog title row exists, else ``False``.
+
+    Raises:
+        DevCliError: If the local REST probe fails unexpectedly.
+    """
+
+    base_url = runtime_env["SUPABASE_URL"].rstrip("/")
+    request = urllib.request.Request(
+        f"{base_url}/rest/v1/titles?select=id&limit=1",
+        headers=build_supabase_bearer_headers(api_key=runtime_env["SUPABASE_SERVICE_ROLE_KEY"]),
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8") or "[]")
+    except urllib.error.HTTPError as ex:
+        detail = ex.read().decode("utf-8", errors="replace").strip()
+        message = f"Failed to probe local demo catalog seed state (HTTP {ex.code})."
+        if detail:
+            message = f"{message}\n{detail}"
+        raise DevCliError(message) from ex
+    except (OSError, urllib.error.URLError, TimeoutError) as ex:
+        raise DevCliError(f"Failed to probe local demo catalog seed state.\n{ex}") from ex
+
+    return isinstance(payload, list) and len(payload) > 0
+
+
+def has_local_required_schema(runtime_env: dict[str, str]) -> bool:
+    """Return whether required maintained local tables are present in PostgREST.
+
+    Args:
+        runtime_env: Resolved local Supabase runtime values.
+
+    Returns:
+        ``True`` when the required maintained tables can be queried, else ``False``.
+    """
+
+    required_tables = (
+        "titles",
+        "genres",
+        "age_rating_authorities",
+    )
+    base_url = runtime_env["SUPABASE_URL"].rstrip("/")
+    headers = build_supabase_bearer_headers(api_key=runtime_env["SUPABASE_SERVICE_ROLE_KEY"])
+
+    for table_name in required_tables:
+        request = urllib.request.Request(
+            f"{base_url}/rest/v1/{table_name}?select=*&limit=1",
+            headers=headers,
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10):
+                continue
+        except urllib.error.HTTPError:
+            return False
+        except (OSError, urllib.error.URLError, TimeoutError) as ex:
+            raise DevCliError(f"Failed to probe local schema readiness for '{table_name}'.\n{ex}") from ex
+
+    return True
+
+
+def ensure_local_demo_seed_data(config: DevConfig, *, runtime_env: dict[str, str]) -> None:
+    """Ensure the local Supabase stack contains deterministic demo data.
+
+    Args:
+        config: CLI configuration containing repository paths.
+        runtime_env: Resolved local Supabase runtime values.
+
+    Returns:
+        None.
+    """
+
+    wait_for_local_supabase_http_ready(runtime_env=runtime_env)
+    if not has_local_required_schema(runtime_env):
+        write_step("Local runtime schema is behind checked-in migrations; resetting and reseeding")
+        run_supabase_stack_command(config, action="db-reset")
+        return
+
+    if has_local_demo_seed_data(runtime_env=runtime_env):
+        return
+
+    write_step("Local runtime has no seeded catalog data; seeding deterministic demo fixtures")
+    seed_migration_data(config, seed_password=LOCAL_SEED_DEFAULT_PASSWORD)
+
+
 def get_workers_dev_vars_path(config: DevConfig) -> Path:
     """Return the local Wrangler dev vars file path for the Workers workspace."""
 
@@ -2090,6 +2288,79 @@ def write_workers_local_dev_vars(config: DevConfig, *, runtime_env: dict[str, st
     return dev_vars_path
 
 
+def get_supabase_project_id(config: DevConfig) -> str:
+    """Return the configured local Supabase project identifier."""
+
+    config_path = config.repo_root / config.supabase_root / "config.toml"
+    if not config_path.exists():
+        raise DevCliError(f"Supabase config was not found: {config_path}")
+
+    match = re.search(r'^\s*project_id\s*=\s*"([^"]+)"\s*$', config_path.read_text(encoding="utf-8"), re.MULTILINE)
+    if not match:
+        raise DevCliError(f"Supabase config did not define project_id: {config_path}")
+    return match.group(1)
+
+
+def list_supabase_project_containers(config: DevConfig) -> list[tuple[str, str]]:
+    """Return Docker container names and statuses for the local Supabase project."""
+
+    project_id = get_supabase_project_id(config)
+    result = run_command(
+        ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Status}}"],
+        cwd=config.repo_root,
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        output = "\n".join(
+            part.strip()
+            for part in ((result.stdout or ""), (result.stderr or ""))
+            if part and part.strip()
+        )
+        raise DevCliError("Failed to inspect Docker containers for local Supabase state." + (f"\n{output}" if output else ""))
+
+    containers: list[tuple[str, str]] = []
+    for line in (result.stdout or "").splitlines():
+        if "\t" not in line:
+            continue
+        name, status = line.split("\t", 1)
+        normalized_name = name.strip()
+        normalized_status = status.strip().lower()
+        if not normalized_name.startswith("supabase_") or not normalized_name.endswith(project_id):
+            continue
+        containers.append((normalized_name, normalized_status))
+
+    return containers
+
+
+def remove_stale_supabase_project_containers(config: DevConfig) -> None:
+    """Remove exited/created/dead Docker containers for the local Supabase project."""
+
+    removable_names = [
+        name
+        for name, status in list_supabase_project_containers(config)
+        if status.startswith(("exited", "created", "dead"))
+    ]
+
+    if not removable_names:
+        return
+
+    write_step("Removing stale local Supabase containers")
+    run_command(["docker", "rm", "-f", *removable_names], cwd=config.repo_root)
+
+
+def force_remove_supabase_project_containers(config: DevConfig) -> bool:
+    """Force-remove all Docker containers for the local Supabase project."""
+
+    removable_names = [name for name, _status in list_supabase_project_containers(config)]
+    if not removable_names:
+        return False
+
+    write_step("Force-removing local Supabase containers")
+    run_command(["docker", "rm", "-f", *removable_names], cwd=config.repo_root)
+    return True
+
+
 def run_supabase_stack_command(config: DevConfig, *, action: str) -> None:
     """Run a Supabase local workflow command from the repository root.
 
@@ -2106,30 +2377,120 @@ def run_supabase_stack_command(config: DevConfig, *, action: str) -> None:
     prefix = resolve_supabase_command_prefix()
 
     if action == "start":
+        ensure_docker_daemon_available()
         write_step("Starting local Supabase services")
-        run_command([*prefix, "start"], cwd=supabase_root)
+        start_command = build_supabase_profile_start_command(
+            prefix=prefix,
+            profile=SUPABASE_PROFILE_WEB,
+        )
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            result = run_command(
+                start_command,
+                cwd=supabase_root,
+                check=False,
+                capture_output=True,
+            )
+            if result.returncode == 0:
+                combined_output = "\n".join(
+                    part.strip()
+                    for part in ((result.stdout or ""), (result.stderr or ""))
+                    if part and part.strip()
+                )
+                try:
+                    runtime_env = get_local_supabase_runtime(config)
+                    wait_for_local_supabase_http_ready(runtime_env=runtime_env)
+                except DevCliError as ex:
+                    if attempt < attempts and (
+                        is_partial_local_supabase_runtime_error(ex)
+                        or is_local_supabase_not_running_error(ex)
+                        or is_transient_supabase_seed_readiness_failure(ex)
+                    ):
+                        print("Local Supabase services were only partially available; restarting the full local profile.")
+                        run_supabase_stack_command(config, action="stop")
+                        time.sleep(2)
+                        continue
+                    raise
+                if combined_output:
+                    print_console_text(combined_output)
+                return
+
+            output = "\n".join(
+                part.strip()
+                for part in ((result.stdout or ""), (result.stderr or ""))
+                if part and part.strip()
+            )
+            if (
+                "supabase start is already running." in output.lower()
+                or "container is not ready: starting" in output.lower()
+            ):
+                runtime_env = get_local_supabase_runtime(config)
+                wait_for_local_supabase_http_ready(runtime_env=runtime_env)
+                if output:
+                    print_console_text(output)
+                return
+            if "The container name " in output and "is already in use" in output and attempt < attempts:
+                remove_stale_supabase_project_containers(config)
+                print("Removed stale local Supabase containers. Retrying Supabase start.")
+                continue
+            if (
+                ("a prune operation is already running" in output.lower() or "no such container:" in output.lower())
+                and attempt < attempts
+            ):
+                print("Docker is still reconciling local Supabase containers; retrying Supabase start.")
+                time.sleep(2)
+                continue
+
+            raise DevCliError("Supabase start failed." + (f"\n{output}" if output else ""))
         return
 
     if action == "stop":
-        write_step("Stopping local Supabase services")
-        result = run_command(
-            [*prefix, "stop"],
-            cwd=supabase_root,
-            check=False,
-            capture_output=True,
-        )
-        if result.returncode == 0:
+        try:
+            ensure_docker_daemon_available()
+        except DevCliError:
+            print("Docker daemon is not reachable; treating local Supabase services as already stopped.")
             return
 
-        output = "\n".join(
-            part.strip()
-            for part in ((result.stdout or ""), (result.stderr or ""))
-            if part and part.strip()
-        )
-        if "No such container" in output or "Cannot connect to the Docker daemon" in output:
-            print("Local Supabase services are already stopped.")
-            return
-        raise DevCliError("Supabase stop failed." + (f"\n{output}" if output else ""))
+        write_step("Stopping local Supabase services")
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            try:
+                result = run_command(
+                    [*prefix, "stop"],
+                    cwd=supabase_root,
+                    check=False,
+                    capture_output=True,
+                    timeout_seconds=SUPABASE_STOP_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                print(
+                    "Supabase CLI stop timed out after "
+                    f"{SUPABASE_STOP_TIMEOUT_SECONDS} seconds; forcing local container cleanup."
+                )
+                if force_remove_supabase_project_containers(config):
+                    print("Forced local Supabase container cleanup completed.")
+                    return
+                print("No local Supabase containers were found. Treating services as stopped.")
+                return
+
+            if result.returncode == 0:
+                return
+
+            output = "\n".join(
+                part.strip()
+                for part in ((result.stdout or ""), (result.stderr or ""))
+                if part and part.strip()
+            )
+            if "No such container" in output or "Cannot connect to the Docker daemon" in output:
+                print("Local Supabase services are already stopped.")
+                return
+
+            if "a prune operation is already running" in output and attempt < attempts:
+                print("Docker is still finishing a previous prune operation; retrying Supabase stop.")
+                time.sleep(2)
+                continue
+
+            raise DevCliError("Supabase stop failed." + (f"\n{output}" if output else ""))
         return
 
     if action == "status":
@@ -2161,26 +2522,74 @@ def run_supabase_stack_command(config: DevConfig, *, action: str) -> None:
         return
 
     if action == "db-reset":
+        ensure_docker_daemon_available()
         write_step("Resetting local Supabase database and reseeding")
-        result = run_command(
-            [*prefix, "db", "reset", "--local"],
-            cwd=supabase_root,
-            check=False,
-            capture_output=True,
-        )
-        if result.returncode != 0:
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            result = run_command(
+                [*prefix, "db", "reset", "--local"],
+                cwd=supabase_root,
+                check=False,
+                capture_output=True,
+            )
+            if result.returncode == 0:
+                try:
+                    seed_migration_data(config, seed_password=LOCAL_SEED_DEFAULT_PASSWORD)
+                    return
+                except DevCliError as ex:
+                    if attempt < attempts and is_transient_supabase_seed_readiness_failure(ex):
+                        print("Local Supabase services were still settling after reset; restarting services and retrying.")
+                        run_supabase_stack_command(config, action="stop")
+                        run_supabase_stack_command(config, action="start")
+                        continue
+                    raise
+
             output = "\n".join(
                 part.strip()
                 for part in ((result.stdout or ""), (result.stderr or ""))
                 if part and part.strip()
             )
+            normalized_output = output.lower()
+            if (
+                "failed to remove container" in normalized_output
+                and "already in progress" in normalized_output
+                and attempt < attempts
+            ):
+                print("Docker is still finishing a previous container removal; retrying Supabase db reset.")
+                time.sleep(2)
+                run_supabase_stack_command(config, action="start")
+                continue
+
+            if (
+                "schema_migrations_pkey" in normalized_output
+                and "duplicate key value violates unique constraint" in normalized_output
+                and attempt < attempts
+            ):
+                print("Local Supabase migration state was inconsistent after reset; restarting services and retrying.")
+                run_supabase_stack_command(config, action="stop")
+                run_supabase_stack_command(config, action="start")
+                continue
+
             if "Error status 502" in output:
                 get_supabase_status_env(config)
                 print("Supabase db reset completed with a transient 502 during service restart; continuing.")
             else:
                 raise DevCliError("Supabase db reset failed." + (f"\n{output}" if output else ""))
-        seed_migration_data(config, seed_password=LOCAL_SEED_DEFAULT_PASSWORD)
-        return
+
+            try:
+                seed_migration_data(config, seed_password=LOCAL_SEED_DEFAULT_PASSWORD)
+                return
+            except DevCliError as ex:
+                if attempt < attempts and (
+                    is_transient_supabase_seed_readiness_failure(ex)
+                    or is_local_supabase_not_running_error(ex)
+                ):
+                    print("Local Supabase services were still settling after reset; restarting services and retrying.")
+                    run_supabase_stack_command(config, action="stop")
+                    run_supabase_stack_command(config, action="start")
+                    continue
+                raise
+        raise DevCliError("Supabase db reset failed after multiple recovery attempts.")
 
     raise DevCliError(f"Unsupported Supabase action: {action}")
 
@@ -2199,7 +2608,17 @@ def seed_migration_data(config: DevConfig, *, seed_password: str) -> None:
     assert_command_available("npm")
     ensure_migration_workspace_scaffolding(config)
     install_migration_workspace_dependencies(config)
-    runtime_env = get_local_supabase_runtime(config)
+    try:
+        runtime_env = get_local_supabase_runtime(config)
+    except DevCliError as ex:
+        if is_partial_local_supabase_runtime_error(ex) or is_local_supabase_not_running_error(ex):
+            print("Local Supabase services were not fully available for seeding; restarting the full local profile.")
+            run_supabase_stack_command(config, action="stop")
+            run_supabase_stack_command(config, action="start")
+            runtime_env = get_local_supabase_runtime(config)
+        else:
+            raise
+    wait_for_local_supabase_http_ready(runtime_env=runtime_env)
     asset_root = (
         config.repo_root
         / "frontend"
@@ -2686,9 +3105,23 @@ def run_api_spec_lint(config: DevConfig) -> None:
         ],
         cwd=config.repo_root,
         check=False,
+        capture_output=True,
     )
     if result.returncode != 0:
-        raise DevCliError("Redocly OpenAPI lint failed.")
+        combined_output = "\n".join(
+            part.strip()
+            for part in ((result.stdout or ""), (result.stderr or ""))
+            if part and part.strip()
+        )
+        normalized_output = combined_output.lower()
+        if (
+            "your api description is valid" in normalized_output
+            and "assertion failed: !(handle->flags & uv_handle_closing)" in normalized_output
+        ):
+            print_console_text(combined_output)
+            print("OpenAPI spec lint passed. Ignoring known Redocly Windows shutdown assertion after successful validation.")
+            return
+        raise DevCliError("Redocly OpenAPI lint failed." + (f"\n{combined_output}" if combined_output else ""))
     print("OpenAPI spec lint passed.")
 
 
@@ -3075,6 +3508,7 @@ def run_verify(
     """
 
     restore_backend(config)
+    run_migration_typecheck(config, restore=False)
     run_tests(config, run_integration=run_integration, restore=False)
     run_frontend_tests(config, restore=False)
     run_root_python_tests(config)
@@ -3129,6 +3563,7 @@ def run_all_tests(
         ensure_submodules(config)
 
     restore_backend(config)
+    run_migration_typecheck(config, restore=False)
     run_tests(config, run_integration=True, restore=False)
     run_root_python_tests(config)
 
@@ -3811,11 +4246,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 reprovision_shared_mock=not args.skip_mock,
             )
         elif args.command == "seed-data":
-            restart_runtime_profile(config, profile=SUPABASE_PROFILE_API)
-            seed_migration_data(
-                config,
-                seed_password=args.seed_password,
-            )
+            run_supabase_stack_command(config, action="start")
+            run_supabase_stack_command(config, action="db-reset")
         elif args.command == "contract-smoke":
             run_contract_smoke(
                 config,

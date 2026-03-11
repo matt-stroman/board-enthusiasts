@@ -54,6 +54,7 @@ python ./scripts/dev.py web --hot-reload
 ```
 
 This starts local Supabase services, the maintained Workers backend, and the SPA, then opens the frontend URL in your default browser.
+If the local Supabase volume is empty, `api` and `web` automatically seed the deterministic demo catalog before the backend starts.
 
 If you only want the API stack:
 
@@ -146,16 +147,40 @@ Profile notes:
 - `database up` uses `supabase db start` to launch PostgreSQL only.
 - `auth up` uses a filtered `supabase start -x ...` profile that keeps only the services needed for auth testing.
 - `api` and `web` use filtered Supabase profiles plus the maintained Workers and SPA dev servers.
+- `api` and `web` automatically seed deterministic demo data when the local Supabase stack has no catalog rows yet.
+- `api` and `web` also detect when the running local Supabase schema is missing required checked-in tables from newer migrations; in that case they automatically run the local reset/reseed flow before startup continues.
 - `web --hot-reload` keeps Vite and Wrangler in their watch-based local development mode.
 - `api down` stops the backend service only by default; add `--include-dependencies` to also stop auth and database services.
 - `web down` stops the frontend service only by default; add `--include-dependencies` to also stop API, auth, and database services.
 - `status` reports only the named service by default; add `--include-dependencies` to include dependency status output.
+- Local auth-facing profiles keep the Supabase email catcher available for signup and recovery flows. When `auth`, `api`, or `web` is running, open [http://127.0.0.1:54324](http://127.0.0.1:54324) to inspect local confirmation and recovery emails.
+- The maintained local Supabase config sets the sender to `Board Enthusiasts <noreply@boardenthusiasts.com>` in [`backend/supabase/config.toml`](../backend/supabase/config.toml). The checked-in branded HTML templates live under [`backend/supabase/templates/`](../backend/supabase/templates/). If a hosted Supabase project is used for staging or production, mirror both that sender identity and those template bodies in the hosted Auth email settings.
+- Hosted Supabase Auth redirect allowlists must include the maintained SPA callback routes, not just the site origin. At minimum mirror the local pattern for `/auth/signin` and `/auth/signin?mode=recovery` on each hosted frontend origin.
+- The maintained web UI now supports both the email link and the Supabase `{code}` value for signup confirmation and password recovery, and the checked-in templates surface both paths in the branded message body.
+- Signup persists `firstName` and `lastName` into Supabase auth user metadata, and the maintained email templates greet the recipient by first name when that metadata is present.
+- Hosted frontend runtime configuration must use HTTPS for both `VITE_SUPABASE_URL` and `VITE_API_BASE_URL`. The SPA only permits plain HTTP for loopback local development endpoints.
+- On Windows, Docker-backed Supabase commands attempt to launch Docker Desktop automatically when the daemon is unavailable. If `supabase stop` stalls, the CLI falls back to project-scoped Docker container cleanup instead of waiting indefinitely.
 
 ### Seed the local stack
 
 ```bash
 python ./scripts/dev.py seed-data
 ```
+
+This refreshes the running local Supabase stack with the full checked-in demo catalog fixture set, including the broader browse/studio seed data used by the maintained UI.
+Use it when you intentionally want to refresh demo rows after changing seed definitions or media; you should not need it just to pick up newly pulled local migrations when starting `api` or `web`.
+
+The maintained local seed roster currently includes 24 users:
+- player coverage across the full roster
+- 6 developer-capable users
+- 2 moderators
+- 1 admin
+- 1 super admin
+
+Primary seeded accounts:
+- developer: `emma.torres@boardtpl.local`
+- moderator/admin: `alex.rivera@boardtpl.local`
+- password: `ChangeMe!123`
 
 ### Run the maintained API contract smoke harness
 
@@ -238,6 +263,7 @@ python ./scripts/dev.py all-tests
 ```
 
 This command runs maintained backend verification, frontend tests, OpenAPI lint, and API contract tests in one pass.
+It also runs the maintained workspace-wide TypeScript typecheck before the backend and frontend suites.
 
 To include the maintained contract run against the local Supabase + Workers stack:
 
@@ -258,6 +284,7 @@ python ./scripts/dev.py verify --start-workers
 ```
 
 This workflow validates the maintained backend, lints the OpenAPI spec, and optionally executes the Postman contract suite.
+It also covers the maintained workspace-wide TypeScript typecheck, frontend tests, and the root Python CLI tests.
 
 ### Authenticate Postman CLI for workspace or mock operations
 
