@@ -4,11 +4,9 @@ A solution for third party developers for the Board ecosystem to use to register
 
 Current implementation status:
 
-- the maintained API/backend/frontend surface includes the Keycloak-backed identity and health foundation, self-service developer access enrollment, verified developer role moderation endpoints, player library and wishlist flows, title reporting with moderator and developer threads, and in-app notifications
-- EF Core migrations for `users`, `user_board_profiles`, `studios`, `studio_memberships`, `studio_links`, `titles`, `title_metadata_versions`, `title_media_assets`, `title_releases`, `release_artifacts`, `supported_publishers`, `integration_connections`, `title_integration_bindings`, `player_owned_titles`, `player_wishlist_entries`, `title_reports`, `title_report_messages`, `user_notifications`, and `user_platform_roles` are implemented
-- Wave 7 delivered the shared workspace shells, in-place developer studio workflows, deterministic local seed data, shared browse/studio catalog UX, and studio public-branding/link management
-- Wave 8 delivered player personalization and moderation follow-up workflows for wishlist, My Games, title reports, and notifications
-- the next planned implementation wave is Wave 9 unified commerce and entitlements
+- the maintained backend runtime now lives in the [`backend`](backend) submodule as Supabase + Cloudflare Workers
+- the maintained executable API contract now lives in the [`api`](api) submodule and targets the Workers/Supabase surface only
+- the maintained frontend runtime now lives in the [`frontend`](frontend) submodule as a React + TypeScript SPA
 
 ## Table of Contents
 
@@ -21,21 +19,23 @@ Current implementation status:
 
 This repository currently tracks backend and frontend as git submodules.
 
-Quick start (full local web stack from the root workspace):
+Quick start (maintained local stack from the repository root):
 
 ```bash
 python ./scripts/dev.py bootstrap
 python ./scripts/dev.py web --hot-reload
 ```
 
-This starts local Docker dependencies, the backend API, the frontend web app with Razor hot reload, and opens the frontend URL in your browser.
-On Windows, the CLI will also try to launch Docker Desktop automatically if it is installed but not already running, trust the local .NET HTTPS development certificate, export localhost TLS material for Keycloak and local PostgreSQL, create a local TLS certificate for Mailpit, and launch the local web stack on secure endpoints. The browser-facing services run on HTTPS, local PostgreSQL connections are TLS-enforced, and Keycloak verification emails are captured locally in Mailpit at [`https://localhost:8025`](https://localhost:8025).
+This starts local Supabase services, the maintained Workers backend, and the SPA.
+If the local Supabase volume is empty, the `api` and `web` entrypoints automatically seed the deterministic demo catalog before the backend starts.
+If the running local Supabase schema is missing required checked-in tables from newer migrations, `api` and `web` automatically reset the local database and reseed before continuing.
+Run `python ./scripts/dev.py seed-data` whenever you want to refresh the full checked-in local demo catalog fixture set after seed changes.
 
-Quick start (backend API + local PostgreSQL + Keycloak only):
+Quick start (backend API only):
 
 ```bash
 python ./scripts/dev.py bootstrap
-python ./scripts/dev.py up
+python ./scripts/dev.py api
 ```
 
 Initialize them after clone:
@@ -54,11 +54,9 @@ git submodule status
 
 - Project-wide developer docs:
   - Developer CLI (root automation commands): [`docs/developer-cli.md`](docs/developer-cli.md)
+  - Maintained stack overview: [`docs/maintained-stack.md`](docs/maintained-stack.md)
 - Backend-specific developer docs (in backend submodule):
-  - Backend phase 1 (PostgreSQL local setup): [`backend/docs/backend-phase-1-postgres-setup.md`](backend/docs/backend-phase-1-postgres-setup.md)
-  - New developer setup / quick start (current backend MVP): [`backend/docs/new-developer-setup.md`](backend/docs/new-developer-setup.md)
-  - Auth and data ownership boundary: [`backend/docs/auth-data-ownership.md`](backend/docs/auth-data-ownership.md)
-  - Current title/catalog schema, lifecycle, media, and release model: [`backend/docs/title-catalog-schema.md`](backend/docs/title-catalog-schema.md)
+  - Backend local runbook: [`backend/docs/workers-backend-local-runbook.md`](backend/docs/workers-backend-local-runbook.md)
 
 ## Planning
 
@@ -87,15 +85,23 @@ Examples:
 ```bash
 python ./scripts/dev.py doctor
 python ./scripts/dev.py bootstrap
+python ./scripts/dev.py database up
+python ./scripts/dev.py auth up
+python ./scripts/dev.py api
+python ./scripts/dev.py api down
+python ./scripts/dev.py api down --include-dependencies
 python ./scripts/dev.py web --hot-reload
-python ./scripts/dev.py web-status
-python ./scripts/dev.py web-stop --down-dependencies
-python ./scripts/dev.py frontend --hot-reload
-python ./scripts/dev.py up
+python ./scripts/dev.py web status
+python ./scripts/dev.py web status --include-dependencies
+python ./scripts/dev.py web down
+python ./scripts/dev.py web down --include-dependencies
 python ./scripts/dev.py all-tests
 python ./scripts/dev.py verify --skip-contract-tests
 python ./scripts/dev.py api-lint
-python ./scripts/dev.py api-test --start-backend
+python ./scripts/dev.py api-test --start-workers
 python ./scripts/dev.py test
-python ./scripts/dev.py down
+python ./scripts/dev.py contract-smoke --start-workers
+python ./scripts/dev.py workers-smoke --start-stack
+python ./scripts/dev.py parity-test
+python ./scripts/dev.py deploy-staging --dry-run
 ```
