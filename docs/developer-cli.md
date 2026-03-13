@@ -61,7 +61,7 @@ The maintained root CLI owns the shared environment-file layout under [`config/`
 - [`config/.env.staging.example`](../config/.env.staging.example) -> copy to `config/.env.staging` for staging deployment inputs
 - [`config/.env.example`](../config/.env.example) -> copy to `config/.env` for future production deployment inputs
 
-For the default hosted Supabase case, `SUPABASE_URL` can be omitted in these files when `SUPABASE_PROJECT_REF` is set; the root CLI backfills `https://<project-ref>.supabase.co` automatically during load.
+For the default hosted Supabase case (where `SUPABASE_URL` is simply composed of `SUPABASE_PROJECT_REF`), `SUPABASE_URL` can be omitted in these files when `SUPABASE_PROJECT_REF` is set; the root CLI backfills `https://<project-ref>.supabase.co` automatically during load.
 
 The live `.env` files are intentionally ignored and must not be committed.
 
