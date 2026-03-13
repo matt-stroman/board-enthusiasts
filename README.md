@@ -118,4 +118,6 @@ The supported root-managed environment files live under [`config/`](config):
 - `config/.env.staging`: staging deployment/operator values used by `deploy-staging`
 - `config/.env`: reserved for future production deployment/operator values
 
+For hosted Supabase environments, `SUPABASE_URL` may be omitted when `SUPABASE_PROJECT_REF` is set and the project uses the default hosted Supabase URL. Keep `SUPABASE_URL` explicit for local development, custom domains, and any non-default routing.
+
 Do not commit those live `.env` files. Only the checked-in `*.example` templates should be tracked.

@@ -360,12 +360,43 @@ def apply_environment_file(path: Path, *, preserve_existing: bool = True) -> dic
     return parsed
 
 
+def infer_supabase_url_from_environment() -> str | None:
+    """Infer the default hosted Supabase URL when only the project ref is available.
+
+    Returns:
+        The inferred hosted Supabase URL when safe, otherwise ``None``.
+    """
+
+    explicit_url = os.environ.get("SUPABASE_URL", "").strip()
+    if explicit_url:
+        return explicit_url
+
+    app_env = os.environ.get("BOARD_ENTHUSIASTS_APP_ENV", "").strip().lower()
+    if app_env == "local":
+        return None
+
+    project_ref = os.environ.get("SUPABASE_PROJECT_REF", "").strip()
+    if not project_ref:
+        return None
+
+    return f"https://{project_ref}.supabase.co"
+
+
+def normalize_supabase_environment() -> None:
+    """Normalize derived Supabase environment values for the current CLI process."""
+
+    inferred_url = infer_supabase_url_from_environment()
+    if inferred_url:
+        os.environ["SUPABASE_URL"] = inferred_url
+
+
 def auto_load_command_environment(config: DevConfig, *, command_name: str) -> Path | None:
     """Load the root-managed environment file relevant to the current CLI command."""
 
     if command_name == "deploy-staging":
         env_path = get_environment_file_path(config, target="staging")
         apply_environment_file(env_path)
+        normalize_supabase_environment()
         return env_path if env_path.exists() else None
 
     if command_name == "env":
@@ -373,6 +404,7 @@ def auto_load_command_environment(config: DevConfig, *, command_name: str) -> Pa
 
     env_path = get_environment_file_path(config, target="local")
     apply_environment_file(env_path)
+    normalize_supabase_environment()
     return env_path if env_path.exists() else None
 
 

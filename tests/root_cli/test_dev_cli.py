@@ -101,6 +101,64 @@ class DevCliMigrationHelperTests(unittest.TestCase):
 
             self.assertEqual({"FIRST": "from-file", "SECOND": "from-file"}, parsed)
 
+    def test_infer_supabase_url_from_project_ref_for_hosted_env(self) -> None:
+        with mock.patch.dict(
+            dev.os.environ,
+            {
+                "BOARD_ENTHUSIASTS_APP_ENV": "staging",
+                "SUPABASE_PROJECT_REF": "project-ref-123",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                "https://project-ref-123.supabase.co",
+                dev.infer_supabase_url_from_environment(),
+            )
+
+    def test_infer_supabase_url_respects_explicit_override_for_custom_domains(self) -> None:
+        with mock.patch.dict(
+            dev.os.environ,
+            {
+                "BOARD_ENTHUSIASTS_APP_ENV": "production",
+                "SUPABASE_PROJECT_REF": "project-ref-123",
+                "SUPABASE_URL": "https://supabase.boardenthusiasts.com",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                "https://supabase.boardenthusiasts.com",
+                dev.infer_supabase_url_from_environment(),
+            )
+
+    def test_infer_supabase_url_does_not_override_local_environment(self) -> None:
+        with mock.patch.dict(
+            dev.os.environ,
+            {
+                "BOARD_ENTHUSIASTS_APP_ENV": "local",
+                "SUPABASE_PROJECT_REF": "local-dev",
+            },
+            clear=True,
+        ):
+            self.assertIsNone(dev.infer_supabase_url_from_environment())
+
+    def test_auto_load_command_environment_normalizes_inferred_supabase_url(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            args = self.create_args()
+            config = dev.config_from_args(args, repo_root)
+            staging_env_path = repo_root / config.staging_env_file
+            staging_env_path.parent.mkdir(parents=True, exist_ok=True)
+            staging_env_path.write_text(
+                "BOARD_ENTHUSIASTS_APP_ENV=staging\nSUPABASE_PROJECT_REF=project-ref-123\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(dev.os.environ, {}, clear=True):
+                loaded_path = dev.auto_load_command_environment(config, command_name="deploy-staging")
+                self.assertEqual("https://project-ref-123.supabase.co", dev.os.environ["SUPABASE_URL"])
+
+            self.assertEqual(staging_env_path, loaded_path)
+
     def test_build_migration_frontend_environment_can_force_landing_mode(self) -> None:
         args = self.create_args()
         config = dev.config_from_args(args, pathlib.Path.cwd())
