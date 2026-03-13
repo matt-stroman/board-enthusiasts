@@ -270,12 +270,22 @@ python ./scripts/dev.py deploy-staging --workers-only
 
 - `BOARD_ENTHUSIASTS_WORKERS_BASE_URL`
 - `SUPABASE_URL`
+- `SUPABASE_PROJECT_REF`
 - `SUPABASE_PUBLISHABLE_KEY`
 - `SUPABASE_SECRET_KEY`
 - `VITE_TURNSTILE_SITE_KEY`
 - `TURNSTILE_SECRET_KEY`
 - `BREVO_API_KEY`
 - `BREVO_SIGNUPS_LIST_ID`
+
+`SUPABASE_URL` remains supported everywhere. When `SUPABASE_URL` is blank and `SUPABASE_PROJECT_REF` is set, the root CLI infers the default hosted URL as `https://<project-ref>.supabase.co`.
+
+Precedence rules:
+
+- explicit `SUPABASE_URL` wins
+- otherwise the CLI infers the default hosted URL from `SUPABASE_PROJECT_REF`
+- local development should keep an explicit local `SUPABASE_URL`
+- custom domains and vanity subdomains should keep an explicit `SUPABASE_URL`
 
 When `deploy-staging` runs a real Workers deployment, it also syncs the Cloudflare Worker secrets from that same root staging file before deploying the Worker bundle.
 
