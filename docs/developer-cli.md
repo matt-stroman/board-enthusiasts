@@ -61,6 +61,8 @@ The maintained root CLI owns the shared environment-file layout under [`config/`
 - [`config/.env.staging.example`](../config/.env.staging.example) -> copy to `config/.env.staging` for staging deployment inputs
 - [`config/.env.example`](../config/.env.example) -> copy to `config/.env` for future production deployment inputs
 
+For the default hosted Supabase case, `SUPABASE_URL` can be omitted in these files when `SUPABASE_PROJECT_REF` is set; the root CLI backfills `https://<project-ref>.supabase.co` automatically during load.
+
 The live `.env` files are intentionally ignored and must not be committed.
 
 ### First-time setup + run
@@ -419,5 +421,4 @@ The root CLI can populate the maintained authenticated contract checks automatic
 - Tool executables are resolved from each developer's `PATH`; the CLI does not assume fixed install directories for `node`, `npx`, `postman`, `supabase`, `wrangler`, `docker`, or other required tools.
 - Migration workspace dependency installs are cached by lockfile fingerprint so routine commands do not reinstall the entire npm workspace unnecessarily.
 - The root-managed `.env` files are operator/developer inputs for the root CLI. Hosted runtime secrets still live in provider secret/config stores such as Cloudflare Workers secrets and hosted Supabase provider settings.
-
 

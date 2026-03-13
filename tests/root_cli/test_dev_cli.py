@@ -82,6 +82,29 @@ class DevCliMigrationHelperTests(unittest.TestCase):
 
             self.assertEqual({"FIRST": "from-file", "SECOND": "from-file"}, parsed)
 
+    def test_apply_environment_file_backfills_supabase_url_from_project_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = pathlib.Path(temp_dir) / ".env.staging"
+            env_path.write_text("SUPABASE_PROJECT_REF=abc123\n", encoding="utf-8")
+
+            with mock.patch.dict(dev.os.environ, {}, clear=False):
+                dev.os.environ.pop("SUPABASE_URL", None)
+                parsed = dev.apply_environment_file(env_path)
+                self.assertEqual("https://abc123.supabase.co", dev.os.environ["SUPABASE_URL"])
+
+            self.assertEqual("https://abc123.supabase.co", parsed["SUPABASE_URL"])
+
+    def test_apply_environment_file_preserves_existing_supabase_url(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = pathlib.Path(temp_dir) / ".env.staging"
+            env_path.write_text("SUPABASE_PROJECT_REF=abc123\n", encoding="utf-8")
+
+            with mock.patch.dict(dev.os.environ, {"SUPABASE_URL": "https://existing.supabase.co"}, clear=False):
+                parsed = dev.apply_environment_file(env_path)
+                self.assertEqual("https://existing.supabase.co", dev.os.environ["SUPABASE_URL"])
+
+            self.assertEqual("https://abc123.supabase.co", parsed["SUPABASE_URL"])
+
     def test_build_migration_frontend_environment_can_force_landing_mode(self) -> None:
         args = self.create_args()
         config = dev.config_from_args(args, pathlib.Path.cwd())

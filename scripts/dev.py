@@ -264,6 +264,7 @@ def apply_environment_file(path: Path, *, preserve_existing: bool = True) -> dic
         return {}
 
     parsed = parse_env_assignments(path.read_text(encoding="utf-8"))
+    parsed = infer_supabase_url_from_project_ref(parsed)
     original_keys = set(os.environ)
     for key, value in parsed.items():
         if preserve_existing and key in original_keys:
@@ -286,6 +287,21 @@ def auto_load_command_environment(config: DevConfig, *, command_name: str) -> Pa
     env_path = get_environment_file_path(config, target="local")
     apply_environment_file(env_path)
     return env_path if env_path.exists() else None
+
+
+def infer_supabase_url_from_project_ref(
+    env_values: dict[str, str],
+) -> dict[str, str]:
+    """Backfill SUPABASE_URL from SUPABASE_PROJECT_REF when only the ref is provided."""
+
+    normalized = dict(env_values)
+    supabase_url = normalized.get("SUPABASE_URL", "").strip()
+    project_ref = normalized.get("SUPABASE_PROJECT_REF", "").strip()
+
+    if not supabase_url and project_ref:
+        normalized["SUPABASE_URL"] = f"https://{project_ref}.supabase.co"
+
+    return normalized
 
 
 def require_environment_values(*names: str, context: str) -> dict[str, str]:
@@ -4539,4 +4555,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
