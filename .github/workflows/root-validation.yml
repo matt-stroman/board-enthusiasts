@@ -102,8 +102,8 @@ jobs:
       - name: Run contract smoke tests
         run: python ./scripts/dev.py contract-smoke --start-workers
 
-  staging-dry-run:
-    name: Staging Dry Run
+  deploy-cli-surface:
+    name: Deploy CLI Surface
     runs-on: ubuntu-latest
     needs: root-tooling
 
@@ -123,25 +123,28 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Validate staging deployment flow
-        env:
-          CLOUDFLARE_ACCOUNT_ID: ci-dry-run-account
-          CLOUDFLARE_API_TOKEN: ci-dry-run-token
-          BOARD_ENTHUSIASTS_WORKERS_BASE_URL: https://api.staging.example.com
-          SUPABASE_URL: https://example-project.supabase.co
-          SUPABASE_PUBLISHABLE_KEY: ci-dry-run-publishable-key
-          SUPABASE_SECRET_KEY: ci-dry-run-secret-key
-          SUPABASE_AVATARS_BUCKET: avatars
-          SUPABASE_CARD_IMAGES_BUCKET: card-images
-          SUPABASE_HERO_IMAGES_BUCKET: hero-images
-          SUPABASE_LOGO_IMAGES_BUCKET: logo-images
-          VITE_TURNSTILE_SITE_KEY: ci-dry-run-turnstile-site-key
-          TURNSTILE_SECRET_KEY: ci-dry-run-turnstile-secret-key
-          BREVO_API_KEY: ci-dry-run-brevo-api-key
-          BREVO_SIGNUPS_LIST_ID: 1
-          ALLOWED_WEB_ORIGINS: https://boardenthusiasts.com,https://staging.boardenthusiasts.com
-          SUPPORT_REPORT_RECIPIENT: support@boardenthusiasts.com
-          SUPPORT_REPORT_SENDER_EMAIL: noreply@boardenthusiasts.com
-          SUPPORT_REPORT_SENDER_NAME: Board Enthusiasts
-          VITE_LANDING_MODE: "true"
-        run: python ./scripts/dev.py deploy-staging --dry-run
+      - name: Validate deploy command surface
+        run: |
+          python ./scripts/dev.py deploy --help
+          python - <<'PY'
+          from pathlib import Path
+
+          required = {
+              "config/.env.staging.example": [
+                  "SUPABASE_DB_PASSWORD=",
+                  "SUPABASE_ACCESS_TOKEN=",
+                  "DEPLOY_SMOKE_SECRET=",
+              ],
+              "config/.env.example": [
+                  "SUPABASE_DB_PASSWORD=",
+                  "SUPABASE_ACCESS_TOKEN=",
+                  "DEPLOY_SMOKE_SECRET=",
+              ],
+          }
+
+          for path, expected_lines in required.items():
+              text = Path(path).read_text(encoding="utf-8")
+              missing = [line for line in expected_lines if line not in text]
+              if missing:
+                  raise SystemExit(f"{path} is missing expected deploy keys: {missing}")
+          PY

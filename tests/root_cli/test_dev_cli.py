@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import pathlib
 import subprocess
 import sys
@@ -101,6 +102,28 @@ class DevCliMigrationHelperTests(unittest.TestCase):
 
             self.assertEqual({"FIRST": "from-file", "SECOND": "from-file"}, parsed)
 
+    def test_require_environment_values_treats_placeholders_as_missing(self) -> None:
+        with mock.patch.dict(
+            dev.os.environ,
+            {
+                "PRESENT": "value",
+                "PLACEHOLDER": "replace-me",
+                "OPTIONAL_STYLE": "optional-for-staging",
+            },
+            clear=True,
+        ):
+            with self.assertRaises(dev.DevCliError) as raised:
+                dev.require_environment_values("PRESENT", "PLACEHOLDER", "OPTIONAL_STYLE", context="Deploy test")
+
+        self.assertIn("PLACEHOLDER", str(raised.exception))
+        self.assertIn("OPTIONAL_STYLE", str(raised.exception))
+
+    def test_is_github_environment_secret_matches_expected_split(self) -> None:
+        self.assertTrue(dev.is_github_environment_secret("SUPABASE_SECRET_KEY"))
+        self.assertTrue(dev.is_github_environment_secret("DEPLOY_SMOKE_SECRET"))
+        self.assertFalse(dev.is_github_environment_secret("SUPABASE_PUBLISHABLE_KEY"))
+        self.assertFalse(dev.is_github_environment_secret("BREVO_SIGNUPS_LIST_ID"))
+
     def test_infer_supabase_url_from_project_ref_for_hosted_env(self) -> None:
         with mock.patch.dict(
             dev.os.environ,
@@ -154,10 +177,64 @@ class DevCliMigrationHelperTests(unittest.TestCase):
             )
 
             with mock.patch.dict(dev.os.environ, {}, clear=True):
-                loaded_path = dev.auto_load_command_environment(config, command_name="deploy-staging")
+                loaded_path = dev.auto_load_command_environment(
+                    config,
+                    command_name="deploy",
+                    deploy_target="staging",
+                )
                 self.assertEqual("https://project-ref-123.supabase.co", dev.os.environ["SUPABASE_URL"])
 
             self.assertEqual(staging_env_path, loaded_path)
+
+    def test_normalize_deploy_stage_state_requires_upgrade_for_new_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            config = dev.config_from_args(self.create_args(), repo_root)
+            dev.save_deploy_state(
+                config,
+                target="staging",
+                state={
+                    "target": "staging",
+                    "fingerprint": "old-fingerprint",
+                    "completed_stages": ["supabase_schema"],
+                },
+            )
+
+            with self.assertRaises(dev.DevCliError) as raised:
+                dev.normalize_deploy_stage_state(
+                    config,
+                    target="staging",
+                    fingerprint="new-fingerprint",
+                    force=False,
+                    upgrade=False,
+                )
+
+        self.assertIn("--upgrade", str(raised.exception))
+
+    def test_normalize_deploy_stage_state_resets_completed_stages_for_upgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            config = dev.config_from_args(self.create_args(), repo_root)
+            dev.save_deploy_state(
+                config,
+                target="staging",
+                state={
+                    "target": "staging",
+                    "fingerprint": "old-fingerprint",
+                    "completed_stages": ["supabase_schema", "pages_project"],
+                },
+            )
+
+            completed_stages, state = dev.normalize_deploy_stage_state(
+                config,
+                target="staging",
+                fingerprint="new-fingerprint",
+                force=False,
+                upgrade=True,
+            )
+
+        self.assertEqual(set(), completed_stages)
+        self.assertEqual("new-fingerprint", state["fingerprint"])
 
     def test_build_migration_frontend_environment_can_force_landing_mode(self) -> None:
         args = self.create_args()
@@ -178,6 +255,34 @@ class DevCliMigrationHelperTests(unittest.TestCase):
         self.assertEqual("publishable-key", environment["VITE_SUPABASE_PUBLISHABLE_KEY"])
         self.assertEqual("site-key", environment["VITE_TURNSTILE_SITE_KEY"])
         self.assertEqual("true", environment["VITE_LANDING_MODE"])
+
+    def test_get_deploy_worker_config_path_rewrites_main_relative_to_generated_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            args = self.create_args()
+            config = dev.config_from_args(args, repo_root)
+            template_path = repo_root / config.cloudflare_workers_template
+            template_path.parent.mkdir(parents=True, exist_ok=True)
+            template_path.write_text(
+                "\n".join(
+                    [
+                        '{',
+                        '  "name": "board-enthusiasts-api-staging",',
+                        '  "main": "../../apps/workers-api/src/worker.ts",',
+                        '  "vars": {',
+                        '    "APP_ENV": "staging"',
+                        "  }",
+                        "}",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            rendered_path = dev.get_deploy_worker_config_path(config, target="staging")
+            rendered = rendered_path.read_text(encoding="utf-8")
+
+        self.assertIn('"main": "../backend/apps/workers-api/src/worker.ts"', rendered)
 
     def test_has_local_required_schema_includes_marketing_contacts(self) -> None:
         runtime_env = {
@@ -951,6 +1056,230 @@ class DevCliMigrationHelperTests(unittest.TestCase):
         self.assertEqual("up", web_args.action)
         self.assertTrue(web_args.landing_mode)
         self.assertTrue(web_args.no_browser)
+
+    def test_deploy_parser_defaults_to_production(self) -> None:
+        parser = dev.build_parser()
+
+        deploy_args = parser.parse_args(["deploy"])
+
+        self.assertFalse(deploy_args.staging)
+        self.assertFalse(deploy_args.force)
+        self.assertFalse(deploy_args.upgrade)
+        self.assertFalse(deploy_args.preflight_only)
+        self.assertFalse(deploy_args.dry_run_only)
+
+    def test_deploy_parser_accepts_staging_and_resume_flags(self) -> None:
+        parser = dev.build_parser()
+
+        deploy_args = parser.parse_args(["deploy", "--staging", "--upgrade", "--preflight-only"])
+        legacy_args = parser.parse_args(["deploy-staging", "--force", "--dry-run-only"])
+
+        self.assertTrue(deploy_args.staging)
+        self.assertTrue(deploy_args.upgrade)
+        self.assertTrue(deploy_args.preflight_only)
+        self.assertTrue(legacy_args.force)
+        self.assertTrue(legacy_args.dry_run_only)
+
+    def test_env_parser_accepts_github_environment_sync_flags(self) -> None:
+        parser = dev.build_parser()
+
+        env_args = parser.parse_args(
+            [
+                "env",
+                "staging",
+                "--sync-github-environment",
+                "--github-environment",
+                "staging-release",
+                "--repo",
+                "matt-stroman/board-enthusiasts",
+            ]
+        )
+
+        self.assertEqual("staging", env_args.target)
+        self.assertTrue(env_args.sync_github_environment)
+        self.assertEqual("staging-release", env_args.github_environment)
+        self.assertEqual("matt-stroman/board-enthusiasts", env_args.repo)
+
+    def test_sync_root_environment_file_to_github_environment_sets_vars_and_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            config = dev.config_from_args(self.create_args(), repo_root)
+            env_path = repo_root / config.staging_env_file
+            env_path.parent.mkdir(parents=True, exist_ok=True)
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "BOARD_ENTHUSIASTS_APP_ENV=staging",
+                        "SUPABASE_PUBLISHABLE_KEY=publishable",
+                        "SUPABASE_SECRET_KEY=secret",
+                        "SUPABASE_URL=",
+                        "BREVO_SIGNUPS_LIST_ID=3",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            run_calls: list[list[str]] = []
+
+            def fake_run_command(cmd, **kwargs):
+                run_calls.append(list(cmd))
+                if cmd[:3] == ["gh", "auth", "status"]:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with (
+                mock.patch.object(dev, "assert_command_available"),
+                mock.patch.object(dev, "run_command", side_effect=fake_run_command),
+            ):
+                dev.sync_root_environment_file_to_github_environment(
+                    config,
+                    target="staging",
+                    github_environment=None,
+                    github_repo="matt-stroman/board-enthusiasts",
+                )
+
+        self.assertEqual(["gh", "auth", "status"], run_calls[0][:3])
+        self.assertIn(
+            [
+                "gh",
+                "variable",
+                "set",
+                "BOARD_ENTHUSIASTS_APP_ENV",
+                "--env",
+                "staging",
+                "--body",
+                "staging",
+                "--repo",
+                "matt-stroman/board-enthusiasts",
+            ],
+            run_calls,
+        )
+        self.assertIn(
+            [
+                "gh",
+                "variable",
+                "set",
+                "SUPABASE_PUBLISHABLE_KEY",
+                "--env",
+                "staging",
+                "--body",
+                "publishable",
+                "--repo",
+                "matt-stroman/board-enthusiasts",
+            ],
+            run_calls,
+        )
+        self.assertIn(
+            [
+                "gh",
+                "secret",
+                "set",
+                "SUPABASE_SECRET_KEY",
+                "--env",
+                "staging",
+                "--repo",
+                "matt-stroman/board-enthusiasts",
+            ],
+            run_calls,
+        )
+        flattened = [" ".join(call) for call in run_calls]
+        self.assertFalse(any("SUPABASE_URL" in call for call in flattened))
+
+    def test_sync_root_environment_file_to_github_environment_rejects_local_target(self) -> None:
+        config = dev.config_from_args(self.create_args(), pathlib.Path.cwd())
+
+        with self.assertRaises(dev.DevCliError) as raised:
+            dev.sync_root_environment_file_to_github_environment(
+                config,
+                target="local",
+                github_environment=None,
+                github_repo=None,
+            )
+
+        self.assertIn("staging or production", str(raised.exception))
+
+    def test_infer_github_repo_from_origin_supports_https_remote(self) -> None:
+        config = dev.config_from_args(self.create_args(), pathlib.Path.cwd())
+
+        with mock.patch.object(
+            dev,
+            "run_command",
+            return_value=subprocess.CompletedProcess(
+                ["git", "config", "--get", "remote.origin.url"],
+                0,
+                stdout="https://github.com/matt-stroman/board-enthusiasts.git\n",
+                stderr="",
+            ),
+        ):
+            self.assertEqual("matt-stroman/board-enthusiasts", dev.infer_github_repo_from_origin(config))
+
+    def test_assert_github_environment_sync_detects_var_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            config = dev.config_from_args(self.create_args(), repo_root)
+            env_path = repo_root / config.staging_env_file
+            env_path.parent.mkdir(parents=True, exist_ok=True)
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "BOARD_ENTHUSIASTS_APP_ENV=staging",
+                        "SUPABASE_PUBLISHABLE_KEY=publishable",
+                        "SUPABASE_SECRET_KEY=secret",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            def fake_run_command(cmd, **kwargs):
+                normalized = list(cmd)
+                if normalized[:3] == ["gh", "auth", "status"]:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+                if normalized[:2] == ["git", "config"]:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="https://github.com/matt-stroman/board-enthusiasts.git\n", stderr="")
+                if normalized[:2] == ["gh", "api"]:
+                    path = normalized[2]
+                    if path.endswith("/environments/staging"):
+                        return subprocess.CompletedProcess(cmd, 0, stdout='{"name":"staging"}', stderr="")
+                    if path.endswith("/variables?per_page=100"):
+                        return subprocess.CompletedProcess(
+                            cmd,
+                            0,
+                            stdout=json.dumps({"variables": [{"name": "BOARD_ENTHUSIASTS_APP_ENV", "value": "staging"}]}),
+                            stderr="",
+                        )
+                    if path.endswith("/secrets?per_page=100"):
+                        return subprocess.CompletedProcess(
+                            cmd,
+                            0,
+                            stdout=json.dumps({"secrets": [{"name": "SUPABASE_SECRET_KEY"}]}),
+                            stderr="",
+                        )
+                raise AssertionError(f"Unexpected command: {normalized}")
+
+            with (
+                mock.patch.object(dev, "assert_command_available"),
+                mock.patch.object(dev, "run_command", side_effect=fake_run_command),
+                mock.patch.dict(dev.os.environ, {}, clear=True),
+            ):
+                with self.assertRaises(dev.DevCliError) as raised:
+                    dev.assert_github_environment_sync(config, target="staging")
+
+        self.assertIn("mismatched vars", str(raised.exception))
+
+    def test_assert_github_environment_sync_skips_inside_github_actions(self) -> None:
+        config = dev.config_from_args(self.create_args(), pathlib.Path.cwd())
+
+        with (
+            mock.patch.object(dev, "assert_command_available") as assert_command_available,
+            mock.patch.object(dev, "run_command") as run_command,
+            mock.patch.dict(dev.os.environ, {"GITHUB_ACTIONS": "true"}, clear=False),
+        ):
+            dev.assert_github_environment_sync(config, target="staging")
+
+        assert_command_available.assert_not_called()
+        run_command.assert_not_called()
 
     def test_status_and_down_parsers_accept_include_dependencies(self) -> None:
         parser = dev.build_parser()

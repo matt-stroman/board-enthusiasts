@@ -1,10 +1,11 @@
-# Production Landing Page Human-Required Setup
+# Landing Page Human-Required Setup
 
 ## Table of Contents
 
 - [Purpose](#purpose)
 - [Project Context](#project-context)
 - [Target Outcome](#target-outcome)
+- [Staging-First Rollout](#staging-first-rollout)
 - [What Must Stay Manual](#what-must-stay-manual)
 - [What Should Be Automated In The Repository](#what-should-be-automated-in-the-repository)
 - [Accounts And Access Checklist](#accounts-and-access-checklist)
@@ -16,7 +17,7 @@
 
 ## Purpose
 
-This document is written for a human operator who needs to stand up the minimum provider accounts and production configuration required to launch the first public Board Enthusiasts landing page on `boardenthusiasts.com`.
+This document is written for a human operator who needs to stand up the minimum provider accounts and hosted configuration required to launch the first public Board Enthusiasts landing page, validating everything in staging before promoting the same setup to production.
 
 It is intentionally written so it can be handed to another AI agent or human without direct access to this repository.
 
@@ -48,11 +49,34 @@ Important constraint:
 After this setup is complete, the operator should have:
 
 1. A Cloudflare-managed `boardenthusiasts.com` zone.
-2. A production Supabase project for BE.
+2. A hosted Supabase project for staging and a hosted Supabase project for production.
 3. A Brevo account authenticated for the BE domain.
 4. A Gmail inbox (`matt@mattstroman.com`) receiving forwarded BE email.
 5. Gmail configured to send as BE email aliases using Brevo SMTP.
-6. Enough provider credentials and identifiers stored as repository secrets to let the repo own future deploys and most configuration drift.
+6. A staging environment file (`config/.env.staging`) populated for `python ./scripts/dev.py deploy --staging`.
+7. Enough provider credentials and identifiers stored securely to let the repository own repeatable staging and production deploys with minimal manual drift.
+
+## Staging-First Rollout
+
+The maintained deployment path is now:
+
+1. populate `config/.env.staging`
+2. run `python ./scripts/dev.py deploy --staging --dry-run-only`
+3. run a real staging deploy with `python ./scripts/dev.py deploy --staging`
+4. validate the remote staging stack end to end
+5. only after staging is healthy, populate `config/.env` for production and promote the same configuration pattern there
+
+Important implementation detail:
+
+- the root CLI is the operator entrypoint
+- `config/.env.staging` is the canonical input source for staging deploy values
+- `deploy` defaults to production and `--staging` selects the staging target
+- the CLI runs preflight and dry-run checks before any real deploy stages
+- the CLI applies hosted Supabase migrations and bucket provisioning as part of the deploy stages
+- the CLI builds the SPA locally with the public target runtime values
+- the CLI syncs Worker secrets from `config/.env.staging` into Cloudflare before a real Workers deploy
+- the CLI runs a post-deploy smoke test after hosted publish completes
+- bucket names currently remain environment-file values, even though provisioning is repo-owned
 
 ## What Must Stay Manual
 
@@ -425,32 +449,111 @@ Success check:
 
 - you have both Turnstile keys available for deployment
 
-### 13. Add Repository Secrets
+### 13. Add GitHub Environment Variables And Secrets
 
 Goal:
 
-- give the repository enough credentials to deploy and run without storing secrets in source control
+- give the repository enough credentials to deploy and run without storing secrets in source control, including GitHub web-UI-triggered deploys
 
 Steps:
 
 1. Open the GitHub repository settings.
-2. Open the secrets area used by your deployment flow.
-3. Add the provider secrets gathered earlier.
-4. At minimum, expect secrets for:
-   - Cloudflare API token
-   - Supabase project reference
-   - Supabase publishable key
-   - Supabase secret key
-   - Turnstile secret key
-   - Brevo API key
-   - Brevo SMTP credentials if deployment tooling needs them
-5. Save each secret carefully.
+2. Open `Environments`.
+3. Create environment `staging`.
+4. Create environment `production`.
+5. For each environment, add the non-secret deploy values as Environment `vars`.
+6. For each environment, add the sensitive deploy values as Environment `secrets`.
+7. Use the same variable names that appear in the root `.env` templates so the manual deploy workflow can write the environment file without translation.
+8. If production deploys should require an approval step, configure required reviewers on the `production` environment.
+9. Optional but recommended: once `config/.env.staging` or `config/.env` is populated locally, publish it into the matching GitHub Environment with:
+   - `python ./scripts/dev.py env staging --sync-github-environment`
+   - `python ./scripts/dev.py env production --sync-github-environment`
+10. Re-run that sync any time you change the local env file before a hosted deploy attempt, because deploy preflight now checks the matching GitHub Environment for drift.
+
+Recommended Environment `vars`:
+
+- `BOARD_ENTHUSIASTS_SPA_BASE_URL`
+- `BOARD_ENTHUSIASTS_WORKERS_BASE_URL`
+- `SUPABASE_PROJECT_REF`
+- `SUPABASE_URL`
+- `SUPABASE_PUBLISHABLE_KEY`
+- `SUPABASE_AVATARS_BUCKET`
+- `SUPABASE_CARD_IMAGES_BUCKET`
+- `SUPABASE_HERO_IMAGES_BUCKET`
+- `SUPABASE_LOGO_IMAGES_BUCKET`
+- `CLOUDFLARE_ACCOUNT_ID`
+- `VITE_TURNSTILE_SITE_KEY`
+- `BREVO_SIGNUPS_LIST_ID`
+- `ALLOWED_WEB_ORIGINS`
+- `SUPPORT_REPORT_RECIPIENT`
+- `SUPPORT_REPORT_SENDER_EMAIL`
+- `SUPPORT_REPORT_SENDER_NAME`
+- `VITE_LANDING_MODE`
+
+Recommended Environment `secrets`:
+
+- `SUPABASE_SECRET_KEY`
+- `SUPABASE_DB_PASSWORD`
+- `SUPABASE_ACCESS_TOKEN`
+- `CLOUDFLARE_API_TOKEN`
+- `TURNSTILE_SECRET_KEY`
+- `BREVO_API_KEY`
+- `DEPLOY_SMOKE_SECRET`
+
+Optional future hosted-auth values:
+
+- `SUPABASE_AUTH_GITHUB_CLIENT_ID`
+- `SUPABASE_AUTH_GITHUB_CLIENT_SECRET`
+- `SUPABASE_AUTH_GOOGLE_CLIENT_ID`
+- `SUPABASE_AUTH_GOOGLE_CLIENT_SECRET`
 
 Success check:
 
-- repository secrets are present and limited to the environments that need them
+- GitHub Environments `staging` and `production` are configured with the required vars/secrets
+- the `Manual Deploy` workflow in GitHub Actions can target either environment
 
-### 14. Perform A Manual Smoke Test
+### 14. Populate The Root Staging Environment File
+
+Goal:
+
+- prepare the exact operator-owned input file that the maintained root CLI uses for staging deploys
+
+Steps:
+
+1. In the repository root, copy [`config/.env.staging.example`](../config/.env.staging.example) to `config/.env.staging` if that file does not already exist.
+2. Populate the staging values gathered during provider setup.
+3. Use the current real values for:
+   - `BOARD_ENTHUSIASTS_WORKERS_BASE_URL`
+   - `SUPABASE_URL` or `SUPABASE_PROJECT_REF`
+   - `SUPABASE_PUBLISHABLE_KEY`
+   - `SUPABASE_SECRET_KEY`
+   - `SUPABASE_AVATARS_BUCKET`
+   - `SUPABASE_CARD_IMAGES_BUCKET`
+   - `SUPABASE_HERO_IMAGES_BUCKET`
+   - `SUPABASE_LOGO_IMAGES_BUCKET`
+   - `CLOUDFLARE_ACCOUNT_ID`
+   - `CLOUDFLARE_API_TOKEN`
+   - `VITE_TURNSTILE_SITE_KEY`
+   - `TURNSTILE_SECRET_KEY`
+   - `BREVO_API_KEY`
+   - `BREVO_SIGNUPS_LIST_ID`
+   - `ALLOWED_WEB_ORIGINS`
+   - `SUPPORT_REPORT_RECIPIENT`
+   - `SUPPORT_REPORT_SENDER_EMAIL`
+   - `SUPPORT_REPORT_SENDER_NAME`
+   - `VITE_LANDING_MODE=true`
+4. Leave future-MVP hosted auth values blank if they are not being validated in this landing-page staging wave:
+   - `SUPABASE_AUTH_GITHUB_CLIENT_ID`
+   - `SUPABASE_AUTH_GITHUB_CLIENT_SECRET`
+   - `SUPABASE_AUTH_GOOGLE_CLIENT_ID`
+   - `SUPABASE_AUTH_GOOGLE_CLIENT_SECRET`
+5. Keep `replace-me` out of the live file. Use real values or leave optional values blank.
+
+Success check:
+
+- `config/.env.staging` is complete enough that `python ./scripts/dev.py deploy --staging --dry-run-only` can validate without missing-env failures
+
+### 15. Perform A Manual Smoke Test
 
 Goal:
 
@@ -475,15 +578,98 @@ Before handing off to implementation:
 
 - Cloudflare zone is active
 - `boardenthusiasts.com` DNS is managed in Cloudflare
+- Supabase staging project exists
 - Supabase production project exists
 - Brevo domain authentication is green
 - Cloudflare Email Routing forwards BE aliases to `matt@mattstroman.com`
 - Gmail can send as `contact@` and `support@`
 - Turnstile keys exist
 - provider secrets are stored securely
-- repository secrets are configured
+- `config/.env.staging` is populated with real staging values
 - Brevo waitlist created and its numeric ID is stored as `BREVO_SIGNUPS_LIST_ID`
 - Brevo custom attributes `SOURCE`, `BE_LIFECYCLE_STATUS`, and `BE_ROLE_INTEREST` exist as Text type
+
+## Final Preparation Checklist
+
+Run this checklist before the first staging deploy attempt.
+
+### Provider/account readiness
+
+- Cloudflare zone for `boardenthusiasts.com` is active.
+- Supabase staging project exists and you have its URL, publishable key, and secret key.
+- Supabase production project also exists so the environment split is established up front.
+- Brevo domain authentication is green.
+- Brevo `BE Waitlist` list exists and its numeric ID is recorded.
+- Brevo contact attributes `SOURCE`, `BE_LIFECYCLE_STATUS`, and `BE_ROLE_INTEREST` exist as Text attributes.
+- Gmail can send as `contact@boardenthusiasts.com` and `support@boardenthusiasts.com`.
+- Cloudflare Email Routing forwards inbound BE aliases into `matt@mattstroman.com`.
+
+### Repository/IaC readiness
+
+- `config/.env.staging` exists and is populated with real values.
+- `config/.env.staging` contains the four media bucket names used by the current typed-bucket implementation:
+  - `avatars`
+  - `card-images`
+  - `hero-images`
+  - `logo-images`
+- `config/.env.staging` also contains the hosted deploy-specific values required by the current automation:
+  - `SUPABASE_DB_PASSWORD`
+  - `SUPABASE_ACCESS_TOKEN`
+  - `DEPLOY_SMOKE_SECRET`
+- The root CLI is the planned operator entrypoint:
+  - `python ./scripts/dev.py deploy --staging --dry-run-only`
+  - `python ./scripts/dev.py deploy --staging`
+- Local deploy preflight will now also verify that GitHub Environment `staging` matches the checked-out `config/.env.staging` for vars and secret names.
+- The matching GitHub Environment `staging` is populated if you want web-UI-triggered deploys.
+- The matching GitHub Environment `production` is populated if you want web-UI-triggered production deploys later.
+- You understand which values are repo-built public runtime values versus Worker secrets:
+  - SPA build values are injected during the staging build
+  - Worker secrets are synced into Cloudflare from the same staging env file during real deploys
+- No live `.env` files are committed.
+
+### What the repo already automates
+
+- SPA staging build values from `config/.env.staging`
+- Cloudflare Pages staging deploy
+- Cloudflare Workers staging deploy
+- Cloudflare Worker secret sync for:
+  - `SUPABASE_SECRET_KEY`
+  - `TURNSTILE_SECRET_KEY`
+  - `BREVO_API_KEY`
+- Cloudflare Worker secret sync for `DEPLOY_SMOKE_SECRET`
+- Supabase schema and storage-bucket provisioning through checked-in migrations/seed/provisioning logic
+- landing-page signup sync into Supabase and Brevo using the dedicated waitlist list and required Brevo attributes
+- post-deploy smoke verification against the hosted Worker and hosted landing page
+
+### What is still intentionally manual
+
+- provider account creation and verification flows
+- DNS zone onboarding and propagation waiting
+- Gmail alias verification
+- Brevo list and contact-attribute creation
+- hosted Supabase social-auth provider setup for future MVP auth flows
+
+### First deployment sequence
+
+1. Run `python ./scripts/dev.py deploy --staging --dry-run-only`.
+2. Fix any missing values or provider auth failures that preflight or dry-run expose.
+3. Run `python ./scripts/dev.py deploy --staging`.
+4. Validate staging end to end:
+   - landing page loads
+   - signup succeeds
+   - Turnstile works remotely
+   - Supabase row is created
+   - Brevo contact is added to `BE Waitlist`
+   - support issue report path works
+5. Only after staging is healthy, populate `config/.env` for production and repeat the same pattern there.
+
+GitHub web UI alternative:
+
+1. Open `Actions` in GitHub.
+2. Select `Manual Deploy`.
+3. Choose target `staging`.
+4. Use `dry_run_only` first if desired.
+5. Run the workflow once the `staging` GitHub Environment is configured.
 
 ## Known Risks And Recovery Notes
 

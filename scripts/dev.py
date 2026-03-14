@@ -175,6 +175,62 @@ LOCAL_WORKERS_PORT = 8787
 LOCAL_FRONTEND_PORT = 4173
 SUPABASE_STOP_TIMEOUT_SECONDS = 30
 SUPPORTED_ENVIRONMENT_TARGETS = ("local", "staging", "production")
+GITHUB_ENVIRONMENT_SECRET_NAMES = frozenset(
+    {
+        "SUPABASE_SECRET_KEY",
+        "SUPABASE_DB_PASSWORD",
+        "SUPABASE_ACCESS_TOKEN",
+        "SUPABASE_AUTH_GITHUB_CLIENT_SECRET",
+        "SUPABASE_AUTH_GOOGLE_CLIENT_SECRET",
+        "CLOUDFLARE_API_TOKEN",
+        "TURNSTILE_SECRET_KEY",
+        "BREVO_API_KEY",
+        "DEPLOY_SMOKE_SECRET",
+    }
+)
+DEPLOY_REQUIRED_ENV_NAMES = (
+    "BOARD_ENTHUSIASTS_SPA_BASE_URL",
+    "BOARD_ENTHUSIASTS_WORKERS_BASE_URL",
+    "SUPABASE_URL",
+    "SUPABASE_PROJECT_REF",
+    "SUPABASE_PUBLISHABLE_KEY",
+    "SUPABASE_SECRET_KEY",
+    "SUPABASE_DB_PASSWORD",
+    "SUPABASE_ACCESS_TOKEN",
+    "SUPABASE_AVATARS_BUCKET",
+    "SUPABASE_CARD_IMAGES_BUCKET",
+    "SUPABASE_HERO_IMAGES_BUCKET",
+    "SUPABASE_LOGO_IMAGES_BUCKET",
+    "CLOUDFLARE_ACCOUNT_ID",
+    "CLOUDFLARE_API_TOKEN",
+    "VITE_TURNSTILE_SITE_KEY",
+    "TURNSTILE_SECRET_KEY",
+    "BREVO_API_KEY",
+    "BREVO_SIGNUPS_LIST_ID",
+    "ALLOWED_WEB_ORIGINS",
+    "SUPPORT_REPORT_RECIPIENT",
+    "SUPPORT_REPORT_SENDER_EMAIL",
+    "SUPPORT_REPORT_SENDER_NAME",
+    "DEPLOY_SMOKE_SECRET",
+    "VITE_LANDING_MODE",
+)
+DEPLOY_SECRET_ENV_NAMES = (
+    "SUPABASE_SECRET_KEY",
+    "SUPABASE_DB_PASSWORD",
+    "SUPABASE_ACCESS_TOKEN",
+    "CLOUDFLARE_API_TOKEN",
+    "TURNSTILE_SECRET_KEY",
+    "BREVO_API_KEY",
+    "DEPLOY_SMOKE_SECRET",
+)
+DEPLOY_BREVO_REQUIRED_ATTRIBUTES = ("SOURCE", "BE_LIFECYCLE_STATUS", "BE_ROLE_INTEREST")
+DEPLOY_TRANSACTIONAL_STAGES = (
+    "supabase_schema",
+    "supabase_storage",
+    "pages_project",
+    "workers_deploy",
+    "pages_deploy",
+)
 
 LOCAL_SUPABASE_API_PORT_ENV = "BOARD_ENTHUSIASTS_LOCAL_SUPABASE_API_PORT"
 LOCAL_SUPABASE_DB_PORT_ENV = "BOARD_ENTHUSIASTS_LOCAL_SUPABASE_DB_PORT"
@@ -197,6 +253,12 @@ def get_stack_state_path(config: DevConfig, *, stack_name: str) -> Path:
     """
 
     return config.repo_root / ".dev-cli-logs" / f"{stack_name}-state.json"
+
+
+def get_deploy_state_path(config: DevConfig, *, target: str) -> Path:
+    """Return the local persisted deployment-state path for an environment target."""
+
+    return config.repo_root / ".dev-cli-logs" / f"deploy-{target}-state.json"
 
 
 def get_int_environment_override(name: str, *, default: int) -> int:
@@ -390,11 +452,22 @@ def normalize_supabase_environment() -> None:
         os.environ["SUPABASE_URL"] = inferred_url
 
 
-def auto_load_command_environment(config: DevConfig, *, command_name: str) -> Path | None:
+def resolve_deploy_target(*, staging: bool) -> str:
+    """Resolve the logical deployment target from CLI flags."""
+
+    return "staging" if staging else "production"
+
+
+def auto_load_command_environment(
+    config: DevConfig,
+    *,
+    command_name: str,
+    deploy_target: str | None = None,
+) -> Path | None:
     """Load the root-managed environment file relevant to the current CLI command."""
 
-    if command_name == "deploy-staging":
-        env_path = get_environment_file_path(config, target="staging")
+    if command_name in {"deploy-staging", "deploy"}:
+        env_path = get_environment_file_path(config, target=deploy_target or "staging")
         apply_environment_file(env_path)
         normalize_supabase_environment()
         return env_path if env_path.exists() else None
@@ -411,10 +484,17 @@ def auto_load_command_environment(config: DevConfig, *, command_name: str) -> Pa
 def require_environment_values(*names: str, context: str) -> dict[str, str]:
     """Resolve required environment variables or raise a user-friendly error."""
 
+    def normalize_required_value(value: str) -> str:
+        trimmed = value.strip()
+        normalized = trimmed.lower()
+        if normalized.startswith("optional-for-") or normalized == "replace-me" or normalized.startswith("replace-with-"):
+            return ""
+        return trimmed
+
     resolved: dict[str, str] = {}
     missing: list[str] = []
     for name in names:
-        value = os.environ.get(name, "").strip()
+        value = normalize_required_value(os.environ.get(name, ""))
         if not value:
             missing.append(name)
             continue
@@ -1060,6 +1140,39 @@ def clear_stack_state(config: DevConfig, *, stack_name: str) -> None:
     """
 
     get_stack_state_path(config, stack_name=stack_name).unlink(missing_ok=True)
+
+
+def save_deploy_state(config: DevConfig, *, target: str, state: dict[str, object]) -> Path:
+    """Persist deployment stage state for an environment target."""
+
+    state_path = get_deploy_state_path(config, target=target)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    return state_path
+
+
+def load_deploy_state(config: DevConfig, *, target: str) -> dict[str, object] | None:
+    """Load persisted deployment state for an environment target when present."""
+
+    state_path = get_deploy_state_path(config, target=target)
+    if not state_path.exists():
+        return None
+
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as ex:
+        raise DevCliError(f"Deployment state file is invalid JSON: {state_path}") from ex
+
+    if not isinstance(payload, dict):
+        raise DevCliError(f"Deployment state file is invalid JSON: {state_path}")
+
+    return payload
+
+
+def clear_deploy_state(config: DevConfig, *, target: str) -> None:
+    """Delete persisted deployment state for an environment target."""
+
+    get_deploy_state_path(config, target=target).unlink(missing_ok=True)
 
 
 def save_runtime_profile_state(config: DevConfig, *, profile: str) -> Path:
@@ -3216,115 +3329,885 @@ def run_parity_suite(
     run_command(command, cwd=config.repo_root, env=env)
 
 
-def deploy_migration_staging(
+def get_deploy_pages_project_name(*, target: str) -> str:
+    """Return the Cloudflare Pages project name for a deployment target."""
+
+    return "board-enthusiasts-staging" if target == "staging" else "board-enthusiasts"
+
+
+def get_deploy_worker_name(*, target: str) -> str:
+    """Return the Cloudflare Worker script name for a deployment target."""
+
+    return "board-enthusiasts-api-staging" if target == "staging" else "board-enthusiasts-api"
+
+
+def get_deploy_worker_config_path(config: DevConfig, *, target: str) -> Path:
+    """Render a temporary wrangler config file for the target deployment environment."""
+
+    template_path = config.repo_root / config.cloudflare_workers_template
+    rendered_path = config.repo_root / ".dev-cli-logs" / f"wrangler-{target}.generated.jsonc"
+    rendered_path.parent.mkdir(parents=True, exist_ok=True)
+    worker_entry_path = config.repo_root / config.migration_workers_root / "src" / "worker.ts"
+    worker_entry_relative_path = os.path.relpath(worker_entry_path, start=rendered_path.parent).replace("\\", "/")
+
+    rendered = template_path.read_text(encoding="utf-8")
+    rendered = re.sub(
+        r'"name":\s*"[^"]+"',
+        f'"name": "{get_deploy_worker_name(target=target)}"',
+        rendered,
+        count=1,
+    )
+    rendered = re.sub(
+        r'"APP_ENV":\s*"[^"]+"',
+        f'"APP_ENV": "{target}"',
+        rendered,
+        count=1,
+    )
+    rendered = re.sub(
+        r'"main":\s*"[^"]+"',
+        f'"main": "{worker_entry_relative_path}"',
+        rendered,
+        count=1,
+    )
+    rendered_path.write_text(rendered, encoding="utf-8")
+    return rendered_path
+
+
+def build_deploy_frontend_environment(env_values: dict[str, str]) -> dict[str, str]:
+    """Build the public frontend runtime environment for deployment builds."""
+
+    return build_subprocess_env(
+        extra={
+            "VITE_API_BASE_URL": env_values["BOARD_ENTHUSIASTS_WORKERS_BASE_URL"],
+            "VITE_SUPABASE_URL": env_values["SUPABASE_URL"],
+            "VITE_SUPABASE_PUBLISHABLE_KEY": env_values["SUPABASE_PUBLISHABLE_KEY"],
+            "VITE_TURNSTILE_SITE_KEY": env_values["VITE_TURNSTILE_SITE_KEY"],
+            "VITE_LANDING_MODE": env_values["VITE_LANDING_MODE"],
+        }
+    )
+
+
+def build_deploy_subprocess_environment(env_values: dict[str, str]) -> dict[str, str]:
+    """Build the shared subprocess environment for hosted deployment commands."""
+
+    return build_subprocess_env(
+        extra={
+            "SUPABASE_ACCESS_TOKEN": env_values["SUPABASE_ACCESS_TOKEN"],
+            "CLOUDFLARE_API_TOKEN": env_values["CLOUDFLARE_API_TOKEN"],
+            "CLOUDFLARE_ACCOUNT_ID": env_values["CLOUDFLARE_ACCOUNT_ID"],
+        }
+    )
+
+
+def get_git_repository_fingerprint(repo_root: Path) -> dict[str, object]:
+    """Return a lightweight fingerprint of a Git worktree."""
+
+    revision = run_command(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        capture_output=True,
+    ).stdout.strip()
+    status = run_command(
+        ["git", "status", "--short"],
+        cwd=repo_root,
+        capture_output=True,
+    ).stdout.strip()
+    return {
+        "revision": revision,
+        "dirty": bool(status),
+        "status_hash": hashlib.sha256(status.encode("utf-8")).hexdigest()[:16] if status else None,
+    }
+
+
+def build_deploy_fingerprint(config: DevConfig, *, target: str, env_values: dict[str, str]) -> str:
+    """Build a deterministic fingerprint for the current deploy intent."""
+
+    fingerprint_payload = {
+        "target": target,
+        "root": get_git_repository_fingerprint(config.repo_root),
+        "frontend": get_git_repository_fingerprint(config.repo_root / "frontend"),
+        "backend": get_git_repository_fingerprint(config.repo_root / "backend"),
+        "api": get_git_repository_fingerprint(config.repo_root / "api"),
+        "env": {
+            key: env_values[key]
+            for key in (
+                "BOARD_ENTHUSIASTS_SPA_BASE_URL",
+                "BOARD_ENTHUSIASTS_WORKERS_BASE_URL",
+                "SUPABASE_URL",
+                "SUPABASE_PROJECT_REF",
+                "SUPABASE_PUBLISHABLE_KEY",
+                "SUPABASE_AVATARS_BUCKET",
+                "SUPABASE_CARD_IMAGES_BUCKET",
+                "SUPABASE_HERO_IMAGES_BUCKET",
+                "SUPABASE_LOGO_IMAGES_BUCKET",
+                "BREVO_SIGNUPS_LIST_ID",
+                "ALLOWED_WEB_ORIGINS",
+                "SUPPORT_REPORT_RECIPIENT",
+                "SUPPORT_REPORT_SENDER_EMAIL",
+                "SUPPORT_REPORT_SENDER_NAME",
+                "VITE_LANDING_MODE",
+            )
+        },
+        "secrets": {
+            key: hashlib.sha256(env_values[key].encode("utf-8")).hexdigest()[:16]
+            for key in DEPLOY_SECRET_ENV_NAMES
+        },
+    }
+    return hashlib.sha256(json.dumps(fingerprint_payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def request_json(
+    *,
+    url: str,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    payload: dict[str, object] | list[object] | None = None,
+    data: bytes | None = None,
+    timeout_seconds: int = 15,
+) -> object:
+    """Issue an HTTP request and parse the JSON response."""
+
+    request_data = data
+    merged_headers = {"accept": "application/json", **(headers or {})}
+    if payload is not None:
+        request_data = json.dumps(payload).encode("utf-8")
+        merged_headers.setdefault("content-type", "application/json")
+
+    request = urllib.request.Request(url, method=method, headers=merged_headers, data=request_data)
+    context = None
+    if is_local_http_url(url) and is_https_url(url):
+        context = ssl._create_unverified_context()
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds, context=context) as response:
+            body = response.read().decode("utf-8", errors="replace").strip()
+    except urllib.error.HTTPError as ex:
+        detail = ex.read().decode("utf-8", errors="replace").strip()
+        raise DevCliError(f"HTTP {ex.code} {ex.reason} for {url}: {detail or 'no detail'}") from ex
+    except urllib.error.URLError as ex:
+        raise DevCliError(f"Request failed for {url}: {ex.reason}") from ex
+
+    if not body:
+        return {}
+
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as ex:
+        raise DevCliError(f"Expected JSON from {url} but received invalid content.") from ex
+
+
+def collect_named_entries(payload: object) -> set[str]:
+    """Collect every nested ``name`` field from a JSON payload."""
+
+    discovered: set[str] = set()
+    if isinstance(payload, dict):
+        name = payload.get("name")
+        if isinstance(name, str) and name.strip():
+            discovered.add(name.strip())
+        for value in payload.values():
+            discovered.update(collect_named_entries(value))
+    elif isinstance(payload, list):
+        for entry in payload:
+            discovered.update(collect_named_entries(entry))
+    return discovered
+
+
+def assert_url_hostname_resolves(url: str, *, label: str) -> None:
+    """Ensure a deployment URL hostname resolves in DNS."""
+
+    parsed = urllib.parse.urlparse(url)
+    hostname = parsed.hostname
+    if not hostname:
+        raise DevCliError(f"{label} is not a valid URL: {url}")
+
+    try:
+        socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+    except socket.gaierror as ex:
+        raise DevCliError(f"{label} host does not currently resolve in DNS: {hostname}") from ex
+
+
+def get_cloudflare_pages_projects(config: DevConfig, *, env: dict[str, str]) -> list[dict[str, object]]:
+    """Return the accessible Cloudflare Pages projects for the authenticated account."""
+
+    result = run_command(
+        ["npx", "wrangler", "pages", "project", "list", "--json"],
+        cwd=config.repo_root,
+        capture_output=True,
+        env=env,
+    )
+    try:
+        payload = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as ex:
+        raise DevCliError("Cloudflare Pages project listing returned invalid JSON.") from ex
+    if not isinstance(payload, list):
+        raise DevCliError("Cloudflare Pages project listing returned an unexpected payload.")
+    return [entry for entry in payload if isinstance(entry, dict)]
+
+
+def ensure_cloudflare_pages_project(config: DevConfig, *, target: str, env: dict[str, str]) -> None:
+    """Ensure the Cloudflare Pages project exists for the target environment."""
+
+    project_name = get_deploy_pages_project_name(target=target)
+    projects = get_cloudflare_pages_projects(config, env=env)
+    if any(project.get("name") == project_name for project in projects):
+        return
+
+    write_step(f"Creating Cloudflare Pages project {project_name}")
+    run_command(
+        [
+            "npx",
+            "wrangler",
+            "pages",
+            "project",
+            "create",
+            project_name,
+            "--production-branch",
+            "main",
+        ],
+        cwd=config.repo_root,
+        env=env,
+    )
+
+
+def run_supabase_link(config: DevConfig, *, env_values: dict[str, str], subprocess_env: dict[str, str]) -> None:
+    """Link the backend Supabase workspace to the hosted target project."""
+
+    run_command(
+        [
+            "npx",
+            "supabase",
+            "link",
+            "--yes",
+            "--project-ref",
+            env_values["SUPABASE_PROJECT_REF"],
+            "--password",
+            env_values["SUPABASE_DB_PASSWORD"],
+            "--workdir",
+            str(config.repo_root / "backend"),
+        ],
+        cwd=config.repo_root / "backend",
+        env=subprocess_env,
+    )
+
+
+def run_supabase_remote_dry_run(config: DevConfig, *, subprocess_env: dict[str, str]) -> None:
+    """Run a hosted Supabase schema dry-run against the linked project."""
+
+    write_step("Running Supabase remote schema dry-run")
+    run_command(
+        [
+            "npx",
+            "supabase",
+            "db",
+            "push",
+            "--linked",
+            "--dry-run",
+            "--workdir",
+            str(config.repo_root / "backend"),
+        ],
+        cwd=config.repo_root / "backend",
+        env=subprocess_env,
+    )
+
+
+def run_supabase_remote_push(config: DevConfig, *, subprocess_env: dict[str, str]) -> None:
+    """Apply hosted Supabase migrations against the linked project."""
+
+    write_step("Applying Supabase hosted migrations")
+    run_command(
+        [
+            "npx",
+            "supabase",
+            "db",
+            "push",
+            "--linked",
+            "--workdir",
+            str(config.repo_root / "backend"),
+        ],
+        cwd=config.repo_root / "backend",
+        env=subprocess_env,
+    )
+
+
+def run_supabase_bucket_provisioning(config: DevConfig, *, env_values: dict[str, str], subprocess_env: dict[str, str]) -> None:
+    """Provision hosted Supabase storage buckets without seeding demo data."""
+
+    write_step("Provisioning hosted Supabase storage buckets")
+    run_command(
+        [
+            "npm",
+            "run",
+            "seed:migration",
+            "--",
+            "--buckets-only",
+            "--supabase-url",
+            env_values["SUPABASE_URL"],
+            "--secret-key",
+            env_values["SUPABASE_SECRET_KEY"],
+            "--avatars-bucket",
+            env_values["SUPABASE_AVATARS_BUCKET"],
+            "--card-images-bucket",
+            env_values["SUPABASE_CARD_IMAGES_BUCKET"],
+            "--hero-images-bucket",
+            env_values["SUPABASE_HERO_IMAGES_BUCKET"],
+            "--logo-images-bucket",
+            env_values["SUPABASE_LOGO_IMAGES_BUCKET"],
+        ],
+        cwd=config.repo_root,
+        env=subprocess_env,
+    )
+
+
+def build_deploy_stage_state(
+    *,
+    target: str,
+    fingerprint: str,
+    completed_stages: Sequence[str],
+) -> dict[str, object]:
+    """Build the persisted deployment stage-state payload."""
+
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "target": target,
+        "fingerprint": fingerprint,
+        "completed_stages": list(completed_stages),
+        "updated_at": now,
+    }
+
+
+def normalize_deploy_stage_state(
     config: DevConfig,
     *,
-    pages_only: bool,
-    workers_only: bool,
-    dry_run: bool,
+    target: str,
+    fingerprint: str,
+    force: bool,
+    upgrade: bool,
+) -> tuple[set[str], dict[str, object]]:
+    """Resolve persisted deploy state and enforce force/upgrade semantics."""
+
+    if force:
+        clear_deploy_state(config, target=target)
+        return set(), build_deploy_stage_state(target=target, fingerprint=fingerprint, completed_stages=[])
+
+    existing_state = load_deploy_state(config, target=target)
+    if not existing_state:
+        return set(), build_deploy_stage_state(target=target, fingerprint=fingerprint, completed_stages=[])
+
+    existing_fingerprint = str(existing_state.get("fingerprint", ""))
+    existing_completed = existing_state.get("completed_stages")
+    completed_stages = set(existing_completed) if isinstance(existing_completed, list) else set()
+    if existing_fingerprint and existing_fingerprint != fingerprint:
+        if not upgrade:
+            raise DevCliError(
+                f"Deployment state already exists for {target} from a different source fingerprint.\n"
+                "Rerun with --upgrade to apply the new changes or --force to rerun every stage from scratch."
+            )
+        clear_deploy_state(config, target=target)
+        return set(), build_deploy_stage_state(target=target, fingerprint=fingerprint, completed_stages=[])
+
+    return completed_stages, build_deploy_stage_state(
+        target=target,
+        fingerprint=fingerprint,
+        completed_stages=sorted(completed_stages),
+    )
+
+
+def update_deploy_stage_completion(
+    config: DevConfig,
+    *,
+    target: str,
+    fingerprint: str,
+    completed_stages: set[str],
+    stage_name: str,
 ) -> None:
-    """Run the staging deployment wrappers for the maintained workspaces.
+    """Mark a deployment stage as completed in local state."""
 
-    Args:
-        config: CLI configuration containing stack paths.
-        pages_only: Whether to deploy only Cloudflare Pages.
-        workers_only: Whether to deploy only Cloudflare Workers.
-        dry_run: Whether to perform build-only validation instead of deployment.
+    completed_stages.add(stage_name)
+    save_deploy_state(
+        config,
+        target=target,
+        state=build_deploy_stage_state(
+            target=target,
+            fingerprint=fingerprint,
+            completed_stages=sorted(completed_stages),
+        ),
+    )
 
-    Returns:
-        None.
-    """
 
-    if pages_only and workers_only:
-        raise DevCliError("--pages-only and --workers-only cannot be used together.")
+def get_deploy_stage_failure_guidance(*, stage_name: str, target: str) -> str:
+    """Return guidance for a failed deployment stage."""
 
+    stage_guidance = {
+        "supabase_schema": (
+            "Hosted Supabase migrations are not automatically rolled back.\n"
+            "If this stage failed after partially applying migrations, inspect the remote migration history in Supabase before rerunning."
+        ),
+        "supabase_storage": (
+            "Bucket provisioning is idempotent and safe to leave in place.\n"
+            "You can rerun deploy after fixing the underlying error."
+        ),
+        "pages_project": (
+            "Cloudflare Pages project creation is safe to leave in place.\n"
+            "No manual rollback is required before the next attempt."
+        ),
+        "workers_deploy": (
+            "Worker secret sync and publish are rerun-safe, but there is no automatic rollback to the previous secret values.\n"
+            f"If you need to back out immediately, redeploy the last known-good Worker for {target} after correcting the config."
+        ),
+        "pages_deploy": (
+            "Cloudflare Pages deploys are not automatically rolled back.\n"
+            f"If the live site is unhealthy, redeploy the last known-good Pages bundle for {target} after correcting the config."
+        ),
+    }
+    return stage_guidance.get(stage_name, "Fix the failing stage and rerun the deploy command.")
+
+
+def assert_supabase_publishable_access(env_values: dict[str, str]) -> None:
+    """Verify the hosted Supabase publishable key can reach the public auth settings endpoint."""
+
+    url = f"{env_values['SUPABASE_URL'].rstrip('/')}/auth/v1/settings"
+    reachable, detail = probe_http_endpoint(
+        url=url,
+        headers={"apikey": env_values["SUPABASE_PUBLISHABLE_KEY"], "accept": "application/json"},
+    )
+    if not reachable:
+        raise DevCliError(f"Supabase publishable key probe failed: {detail or url}")
+
+
+def assert_supabase_secret_access(env_values: dict[str, str]) -> None:
+    """Verify the hosted Supabase secret key can reach the admin auth API."""
+
+    url = f"{env_values['SUPABASE_URL'].rstrip('/')}/auth/v1/admin/users?page=1&per_page=1"
+    reachable, detail = probe_http_endpoint(
+        url=url,
+        headers=build_supabase_bearer_headers(api_key=env_values["SUPABASE_SECRET_KEY"]),
+    )
+    if not reachable:
+        raise DevCliError(f"Supabase secret key probe failed: {detail or url}")
+
+
+def assert_turnstile_secret_access(env_values: dict[str, str]) -> None:
+    """Verify the configured Turnstile secret can reach siteverify without an invalid-secret response."""
+
+    payload = urllib.parse.urlencode(
+        {
+            "secret": env_values["TURNSTILE_SECRET_KEY"],
+            "response": "deploy-preflight-placeholder-token",
+        }
+    ).encode("utf-8")
+    verification = request_json(
+        url="https://challenges.cloudflare.com/turnstile/v0/siteverify",
+        method="POST",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+        data=payload,
+    )
+    if not isinstance(verification, dict):
+        raise DevCliError("Turnstile siteverify returned an unexpected payload.")
+
+    error_codes = verification.get("error-codes", [])
+    if isinstance(error_codes, list) and any(code == "invalid-input-secret" for code in error_codes):
+        raise DevCliError("Turnstile secret key was rejected by Cloudflare siteverify.")
+
+
+def assert_brevo_configuration(env_values: dict[str, str]) -> None:
+    """Verify Brevo access, list membership target, and required custom attributes."""
+
+    headers = {
+        "api-key": env_values["BREVO_API_KEY"],
+        "accept": "application/json",
+    }
+    list_payload = request_json(
+        url=f"https://api.brevo.com/v3/contacts/lists/{urllib.parse.quote(env_values['BREVO_SIGNUPS_LIST_ID'])}",
+        headers=headers,
+    )
+    if not isinstance(list_payload, dict):
+        raise DevCliError("Brevo list lookup returned an unexpected payload.")
+
+    attribute_payload = request_json(
+        url="https://api.brevo.com/v3/contacts/attributes",
+        headers=headers,
+    )
+    available_attribute_names = collect_named_entries(attribute_payload)
+    missing_attributes = [name for name in DEPLOY_BREVO_REQUIRED_ATTRIBUTES if name not in available_attribute_names]
+    if missing_attributes:
+        raise DevCliError(
+            "Brevo is missing the required contact attributes:\n- " + "\n- ".join(missing_attributes)
+        )
+
+
+def run_deploy_preflight(config: DevConfig, *, target: str, env_values: dict[str, str], subprocess_env: dict[str, str]) -> None:
+    """Run non-mutating provider and environment validation before deployment."""
+
+    write_step(f"Running {target} deploy preflight")
+    assert_github_environment_sync(config, target=target)
+    assert_url_hostname_resolves(env_values["BOARD_ENTHUSIASTS_SPA_BASE_URL"], label="SPA base URL")
+    assert_url_hostname_resolves(env_values["BOARD_ENTHUSIASTS_WORKERS_BASE_URL"], label="Workers base URL")
+    get_cloudflare_pages_projects(config, env=subprocess_env)
+    assert_supabase_publishable_access(env_values)
+    assert_supabase_secret_access(env_values)
+    assert_turnstile_secret_access(env_values)
+    assert_brevo_configuration(env_values)
+    run_supabase_link(config, env_values=env_values, subprocess_env=subprocess_env)
+
+
+def run_deploy_dry_run(config: DevConfig, *, target: str, env_values: dict[str, str], subprocess_env: dict[str, str]) -> None:
+    """Run the full non-publishing deployment dry-run for the target environment."""
+
+    write_step(f"Running {target} deploy dry-run")
+    run_supabase_link(config, env_values=env_values, subprocess_env=subprocess_env)
+    run_supabase_remote_dry_run(config, subprocess_env=subprocess_env)
+
+    write_step("Building SPA for Cloudflare Pages")
+    run_command(
+        build_workspace_npm_command(script_name="build", workspace_name=config.migration_spa_workspace_name),
+        cwd=config.repo_root,
+        env=build_deploy_frontend_environment(env_values),
+    )
+
+    worker_config_path = get_deploy_worker_config_path(config, target=target)
+    write_step("Dry-running Cloudflare Workers bundle")
+    run_command(
+        [
+            "npx",
+            "wrangler",
+            "deploy",
+            "--dry-run",
+            "--config",
+            str(worker_config_path),
+        ],
+        cwd=config.repo_root,
+        env=subprocess_env,
+    )
+
+
+def sync_worker_secret(config: DevConfig, *, worker_config_path: Path, secret_name: str, secret_value: str, subprocess_env: dict[str, str]) -> None:
+    """Sync a single Cloudflare Worker secret to the target script."""
+
+    write_step(f"Syncing Cloudflare Worker secret {secret_name}")
+    run_command(
+        ["npx", "wrangler", "secret", "put", secret_name, "--config", str(worker_config_path)],
+        cwd=config.repo_root,
+        env=subprocess_env,
+        input_data=secret_value,
+    )
+
+
+def run_pages_deploy(config: DevConfig, *, target: str, subprocess_env: dict[str, str]) -> None:
+    """Deploy the built SPA bundle to Cloudflare Pages."""
+
+    run_command(
+        [
+            "npx",
+            "wrangler",
+            "pages",
+            "deploy",
+            str(config.repo_root / config.migration_spa_root / "dist"),
+            "--project-name",
+            get_deploy_pages_project_name(target=target),
+            "--branch",
+            "main",
+        ],
+        cwd=config.repo_root,
+        env=subprocess_env,
+    )
+
+
+def run_workers_deploy(config: DevConfig, *, worker_config_path: Path, subprocess_env: dict[str, str]) -> None:
+    """Deploy the Cloudflare Worker bundle to the target environment."""
+
+    run_command(
+        [
+            "npx",
+            "wrangler",
+            "deploy",
+            "--config",
+            str(worker_config_path),
+        ],
+        cwd=config.repo_root,
+        env=subprocess_env,
+    )
+
+
+def get_brevo_contact(env_values: dict[str, str], *, email: str) -> dict[str, object] | None:
+    """Fetch a Brevo contact by email when it exists."""
+
+    try:
+        payload = request_json(
+            url=f"https://api.brevo.com/v3/contacts/{urllib.parse.quote(email)}?identifierType=email_id",
+            headers={
+                "api-key": env_values["BREVO_API_KEY"],
+                "accept": "application/json",
+            },
+        )
+    except DevCliError as ex:
+        if "HTTP 404" in str(ex):
+            return None
+        raise
+
+    return payload if isinstance(payload, dict) else None
+
+
+def delete_brevo_contact(env_values: dict[str, str], *, email: str) -> None:
+    """Delete a Brevo contact by email when present."""
+
+    try:
+        request_json(
+            url=f"https://api.brevo.com/v3/contacts/{urllib.parse.quote(email)}?identifierType=email_id",
+            method="DELETE",
+            headers={
+                "api-key": env_values["BREVO_API_KEY"],
+                "accept": "application/json",
+            },
+        )
+    except DevCliError as ex:
+        if "HTTP 404" in str(ex):
+            return
+        raise
+
+
+def get_supabase_marketing_contact(env_values: dict[str, str], *, email: str) -> dict[str, object] | None:
+    """Fetch a marketing contact record by normalized email from Supabase."""
+
+    normalized_email = email.strip().lower()
+    payload = request_json(
+        url=(
+            f"{env_values['SUPABASE_URL'].rstrip('/')}/rest/v1/marketing_contacts"
+            f"?select=*&normalized_email=eq.{urllib.parse.quote(normalized_email)}&limit=1"
+        ),
+        headers=build_supabase_bearer_headers(api_key=env_values["SUPABASE_SECRET_KEY"]),
+    )
+    if not isinstance(payload, list):
+        raise DevCliError("Supabase marketing contact lookup returned an unexpected payload.")
+    return payload[0] if payload else None
+
+
+def get_supabase_marketing_contact_role_interests(env_values: dict[str, str], *, contact_id: str) -> list[str]:
+    """Fetch the saved marketing contact role-interest values from Supabase."""
+
+    payload = request_json(
+        url=(
+            f"{env_values['SUPABASE_URL'].rstrip('/')}/rest/v1/marketing_contact_role_interests"
+            f"?select=role&marketing_contact_id=eq.{urllib.parse.quote(contact_id)}"
+        ),
+        headers=build_supabase_bearer_headers(api_key=env_values["SUPABASE_SECRET_KEY"]),
+    )
+    if not isinstance(payload, list):
+        raise DevCliError("Supabase role-interest lookup returned an unexpected payload.")
+    return sorted(
+        [
+            row["role"].strip()
+            for row in payload
+            if isinstance(row, dict) and isinstance(row.get("role"), str) and row["role"].strip()
+        ]
+    )
+
+
+def delete_supabase_marketing_contact(env_values: dict[str, str], *, contact_id: str) -> None:
+    """Delete a marketing contact and its role-interest rows from Supabase."""
+
+    headers = build_supabase_bearer_headers(api_key=env_values["SUPABASE_SECRET_KEY"])
+    request_json(
+        url=(
+            f"{env_values['SUPABASE_URL'].rstrip('/')}/rest/v1/marketing_contact_role_interests"
+            f"?marketing_contact_id=eq.{urllib.parse.quote(contact_id)}"
+        ),
+        method="DELETE",
+        headers={**headers, "Prefer": "return=minimal"},
+    )
+    request_json(
+        url=(
+            f"{env_values['SUPABASE_URL'].rstrip('/')}/rest/v1/marketing_contacts"
+            f"?id=eq.{urllib.parse.quote(contact_id)}"
+        ),
+        method="DELETE",
+        headers={**headers, "Prefer": "return=minimal"},
+    )
+
+
+def run_workers_deploy_smoke(config: DevConfig, *, target: str, env_values: dict[str, str]) -> None:
+    """Exercise the hosted Worker directly after deploy and verify external integrations."""
+
+    write_step("Running post-deploy Workers smoke")
+    base_url = env_values["BOARD_ENTHUSIASTS_WORKERS_BASE_URL"].rstrip("/")
+    spa_origin = env_values["BOARD_ENTHUSIASTS_SPA_BASE_URL"].rstrip("/")
+    smoke_email = f"deploy-smoke+{target}-{int(time.time())}@boardenthusiasts.com"
+    smoke_headers = {
+        "origin": spa_origin,
+        "content-type": "application/json",
+        "accept": "application/json",
+        "x-board-enthusiasts-deploy-smoke-secret": env_values["DEPLOY_SMOKE_SECRET"],
+    }
+
+    root_payload = request_json(url=f"{base_url}/")
+    if not isinstance(root_payload, dict) or root_payload.get("service") != "board-enthusiasts-workers-api":
+        raise DevCliError("Workers smoke failed: unexpected root payload.")
+
+    ready_payload = request_json(url=f"{base_url}/health/ready")
+    if not isinstance(ready_payload, dict) or ready_payload.get("status") != "ready":
+        raise DevCliError("Workers smoke failed: /health/ready did not report ready status.")
+
+    try:
+        signup_payload = request_json(
+            url=f"{base_url}/marketing/signups",
+            method="POST",
+            headers=smoke_headers,
+            payload={
+                "email": smoke_email,
+                "firstName": "Deploy Smoke",
+                "source": "landing_page",
+                "consentTextVersion": "landing-page-v1",
+                "roleInterests": ["player"],
+            },
+        )
+        if not isinstance(signup_payload, dict) or signup_payload.get("accepted") is not True:
+            raise DevCliError("Workers smoke failed: marketing signup was not accepted.")
+
+        contact = get_supabase_marketing_contact(env_values, email=smoke_email)
+        if not contact:
+            raise DevCliError("Workers smoke failed: Supabase marketing contact was not created.")
+        if contact.get("lifecycle_status") != "waitlisted":
+            raise DevCliError("Workers smoke failed: Supabase lifecycle status was not waitlisted.")
+
+        role_interests = get_supabase_marketing_contact_role_interests(env_values, contact_id=str(contact["id"]))
+        if role_interests != ["player"]:
+            raise DevCliError("Workers smoke failed: Supabase role-interest projection was not saved correctly.")
+
+        brevo_contact = get_brevo_contact(env_values, email=smoke_email)
+        if not brevo_contact:
+            raise DevCliError("Workers smoke failed: Brevo contact was not created.")
+
+        support_payload = request_json(
+            url=f"{base_url}/support/issues",
+            method="POST",
+            headers={key: value for key, value in smoke_headers.items() if key != "x-board-enthusiasts-deploy-smoke-secret"},
+            payload={
+                "category": "email_signup",
+                "firstName": "Deploy Smoke",
+                "email": smoke_email,
+                "pageUrl": env_values["BOARD_ENTHUSIASTS_SPA_BASE_URL"],
+                "apiBaseUrl": env_values["BOARD_ENTHUSIASTS_WORKERS_BASE_URL"],
+                "occurredAt": datetime.now(timezone.utc).isoformat(),
+                "errorMessage": "Post-deploy smoke validation",
+                "technicalDetails": "Automated deploy smoke verification",
+                "userAgent": "board-enthusiasts-dev-cli",
+                "language": "en-US",
+                "timeZone": "UTC",
+            },
+        )
+        if not isinstance(support_payload, dict) or support_payload.get("accepted") is not True:
+            raise DevCliError("Workers smoke failed: support issue route did not accept the smoke payload.")
+    finally:
+        contact = get_supabase_marketing_contact(env_values, email=smoke_email)
+        if contact and isinstance(contact.get("id"), str):
+            delete_supabase_marketing_contact(env_values, contact_id=contact["id"])
+        delete_brevo_contact(env_values, email=smoke_email)
+
+
+def run_pages_deploy_smoke(env_values: dict[str, str]) -> None:
+    """Verify the hosted SPA is reachable after deploy."""
+
+    write_step("Running post-deploy Pages smoke")
+    request = urllib.request.Request(
+        env_values["BOARD_ENTHUSIASTS_SPA_BASE_URL"],
+        headers={"accept": "text/html"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            html = response.read().decode("utf-8", errors="replace")
+    except Exception as ex:  # noqa: BLE001
+        raise DevCliError(f"Pages smoke failed: unable to load {env_values['BOARD_ENTHUSIASTS_SPA_BASE_URL']}.") from ex
+
+    if "Board Enthusiasts" not in html or "Get early access" not in html:
+        raise DevCliError("Pages smoke failed: expected landing-page copy was not present in the rendered HTML.")
+
+
+def deploy_migration_target(
+    config: DevConfig,
+    *,
+    target: str,
+    force: bool,
+    upgrade: bool,
+    preflight_only: bool,
+    dry_run_only: bool,
+) -> None:
+    """Deploy the maintained stack to the requested hosted target."""
+
+    if target not in {"staging", "production"}:
+        raise DevCliError(f"Unsupported deploy target: {target}")
+
+    assert_command_available("git")
     assert_command_available("npm")
     ensure_migration_workspace_scaffolding(config)
     install_migration_workspace_dependencies(config)
 
-    require_environment_values(
-        "CLOUDFLARE_ACCOUNT_ID",
-        "CLOUDFLARE_API_TOKEN",
-        context="Cloudflare staging deployment",
+    env_values = require_environment_values(*DEPLOY_REQUIRED_ENV_NAMES, context=f"{target.title()} deployment")
+    subprocess_env = build_deploy_subprocess_environment(env_values)
+
+    run_deploy_preflight(config, target=target, env_values=env_values, subprocess_env=subprocess_env)
+    if preflight_only:
+        return
+
+    run_deploy_dry_run(config, target=target, env_values=env_values, subprocess_env=subprocess_env)
+    if dry_run_only:
+        return
+
+    fingerprint = build_deploy_fingerprint(config, target=target, env_values=env_values)
+    completed_stages, _ = normalize_deploy_stage_state(
+        config,
+        target=target,
+        fingerprint=fingerprint,
+        force=force,
+        upgrade=upgrade,
     )
+    worker_config_path = get_deploy_worker_config_path(config, target=target)
 
-    if not workers_only:
-        staging_frontend_env = require_environment_values(
-            "BOARD_ENTHUSIASTS_WORKERS_BASE_URL",
-            "SUPABASE_URL",
-            "SUPABASE_PUBLISHABLE_KEY",
-            "VITE_TURNSTILE_SITE_KEY",
-            "VITE_LANDING_MODE",
-            context="Cloudflare Pages staging deployment",
-        )
-        write_step("Building SPA for Cloudflare Pages")
-        run_command(
-            build_workspace_npm_command(script_name="build", workspace_name=config.migration_spa_workspace_name),
-            cwd=config.repo_root,
-            env=build_subprocess_env(
-                extra={
-                    "VITE_API_BASE_URL": staging_frontend_env["BOARD_ENTHUSIASTS_WORKERS_BASE_URL"],
-                    "VITE_SUPABASE_URL": staging_frontend_env["SUPABASE_URL"],
-                    "VITE_SUPABASE_PUBLISHABLE_KEY": staging_frontend_env["SUPABASE_PUBLISHABLE_KEY"],
-                    "VITE_TURNSTILE_SITE_KEY": staging_frontend_env["VITE_TURNSTILE_SITE_KEY"],
-                    "VITE_LANDING_MODE": staging_frontend_env["VITE_LANDING_MODE"],
-                }
-            ),
-        )
-        if not dry_run:
-            write_step("Deploying Cloudflare Pages staging bundle")
-            run_command(
-                [
-                    "npx",
-                    "wrangler",
-                    "pages",
-                    "deploy",
-                    str(config.repo_root / config.migration_spa_root / "dist"),
-                    "--project-name",
-                    "board-enthusiasts-staging",
-                    "--branch",
-                    "main",
-                ],
-                cwd=config.repo_root,
-            )
+    for stage_name in DEPLOY_TRANSACTIONAL_STAGES:
+        if stage_name in completed_stages:
+            write_step(f"Skipping completed deploy stage: {stage_name}")
+            continue
 
-    if not pages_only:
-        worker_env_values = require_environment_values(
-            "SUPABASE_URL",
-            "SUPABASE_PUBLISHABLE_KEY",
-            "SUPABASE_SECRET_KEY",
-            "SUPABASE_AVATARS_BUCKET",
-            "SUPABASE_CARD_IMAGES_BUCKET",
-            "SUPABASE_HERO_IMAGES_BUCKET",
-            "SUPABASE_LOGO_IMAGES_BUCKET",
-            "ALLOWED_WEB_ORIGINS",
-            "BREVO_API_KEY",
-            "BREVO_SIGNUPS_LIST_ID",
-            "TURNSTILE_SECRET_KEY",
-            "SUPPORT_REPORT_RECIPIENT",
-            "SUPPORT_REPORT_SENDER_EMAIL",
-            "SUPPORT_REPORT_SENDER_NAME",
-            context="Cloudflare Workers staging deployment",
-        )
-        if not dry_run:
-            for secret_name in ("SUPABASE_SECRET_KEY", "TURNSTILE_SECRET_KEY", "BREVO_API_KEY"):
-                write_step(f"Syncing Cloudflare Worker secret {secret_name}")
-                run_command(
-                    ["npx", "wrangler", "secret", "put", secret_name, "--config", str(config.repo_root / config.cloudflare_workers_template)],
-                    cwd=config.repo_root,
-                    input_data=worker_env_values[secret_name],
-                )
+        try:
+            if stage_name == "supabase_schema":
+                run_supabase_link(config, env_values=env_values, subprocess_env=subprocess_env)
+                run_supabase_remote_push(config, subprocess_env=subprocess_env)
+            elif stage_name == "supabase_storage":
+                run_supabase_bucket_provisioning(config, env_values=env_values, subprocess_env=subprocess_env)
+            elif stage_name == "pages_project":
+                ensure_cloudflare_pages_project(config, target=target, env=subprocess_env)
+            elif stage_name == "workers_deploy":
+                for secret_name in ("SUPABASE_SECRET_KEY", "TURNSTILE_SECRET_KEY", "BREVO_API_KEY", "DEPLOY_SMOKE_SECRET"):
+                    sync_worker_secret(
+                        config,
+                        worker_config_path=worker_config_path,
+                        secret_name=secret_name,
+                        secret_value=env_values[secret_name],
+                        subprocess_env=subprocess_env,
+                    )
+                write_step(f"Deploying Cloudflare Workers bundle for {target}")
+                run_workers_deploy(config, worker_config_path=worker_config_path, subprocess_env=subprocess_env)
+            elif stage_name == "pages_deploy":
+                write_step(f"Deploying Cloudflare Pages bundle for {target}")
+                run_pages_deploy(config, target=target, subprocess_env=subprocess_env)
+            else:
+                raise DevCliError(f"Unknown deploy stage: {stage_name}")
+        except DevCliError as ex:
+            guidance = get_deploy_stage_failure_guidance(stage_name=stage_name, target=target)
+            raise DevCliError(
+                f"Deployment stage '{stage_name}' failed.\n"
+                f"{guidance}\n"
+                f"Original error: {ex}"
+            ) from ex
 
-        write_step("Deploying Cloudflare Workers staging bundle")
-        worker_command = [
-            "npx",
-            "wrangler",
-            "deploy",
-            *(["--dry-run"] if dry_run else []),
-            "--config",
-            str(config.repo_root / config.cloudflare_workers_template),
-        ]
-        run_command(worker_command, cwd=config.repo_root)
+        update_deploy_stage_completion(
+            config,
+            target=target,
+            fingerprint=fingerprint,
+            completed_stages=completed_stages,
+            stage_name=stage_name,
+        )
+
+    run_workers_deploy_smoke(config, target=target, env_values=env_values)
+    run_pages_deploy_smoke(env_values)
 
 
 def run_environment_file_command(
@@ -3333,6 +4216,9 @@ def run_environment_file_command(
     target: str,
     copy_example: bool,
     open_file: bool,
+    sync_github_environment: bool,
+    github_environment: str | None,
+    github_repo: str | None,
 ) -> None:
     """Inspect or bootstrap a root-managed environment file."""
 
@@ -3357,6 +4243,244 @@ def run_environment_file_command(
                 f"Create it from the example first or rerun with 'python ./scripts/dev.py env {target} --copy-example'."
             )
         open_environment_file(env_path)
+
+    if sync_github_environment:
+        sync_root_environment_file_to_github_environment(
+            config,
+            target=target,
+            github_environment=github_environment,
+            github_repo=github_repo,
+        )
+
+
+def is_github_environment_secret(name: str) -> bool:
+    """Return whether the named environment key should be stored as a GitHub Environment secret."""
+
+    return name in GITHUB_ENVIRONMENT_SECRET_NAMES
+
+
+def sync_root_environment_file_to_github_environment(
+    config: DevConfig,
+    *,
+    target: str,
+    github_environment: str | None,
+    github_repo: str | None,
+) -> None:
+    """Publish the checked-out root environment file into the matching GitHub Environment."""
+
+    if target == "local":
+        raise DevCliError("GitHub Environment sync is supported only for staging or production targets, not local.")
+
+    assert_command_available("gh")
+    env_path = get_environment_file_path(config, target=target)
+    if not env_path.exists():
+        raise DevCliError(
+            f"Environment file does not exist yet: {env_path}\n"
+            f"Create it from the example first or rerun with 'python ./scripts/dev.py env {target} --copy-example'."
+        )
+
+    target_environment = (github_environment or target).strip()
+    if not target_environment:
+        raise DevCliError("GitHub Environment name cannot be blank.")
+
+    subprocess_env = build_subprocess_env()
+    auth_status = run_command(
+        ["gh", "auth", "status"],
+        cwd=config.repo_root,
+        env=subprocess_env,
+        check=False,
+        capture_output=True,
+    )
+    if auth_status.returncode != 0:
+        detail = ((auth_status.stderr or "").strip() or (auth_status.stdout or "").strip()) or "GitHub CLI is not authenticated."
+        raise DevCliError(f"Unable to sync GitHub Environment values because gh auth is unavailable.\n{detail}")
+
+    parsed = parse_env_assignments(env_path.read_text(encoding="utf-8"))
+    if not parsed:
+        raise DevCliError(f"Environment file is empty: {env_path}")
+
+    repo_flag = ["--repo", github_repo.strip()] if github_repo and github_repo.strip() else []
+    synced_variables: list[str] = []
+    synced_secrets: list[str] = []
+    skipped_blank: list[str] = []
+
+    write_step(f"Syncing {env_path.name} into GitHub Environment '{target_environment}'")
+    for key, value in parsed.items():
+        trimmed_value = value.strip()
+        if not trimmed_value:
+            skipped_blank.append(key)
+            continue
+
+        if is_github_environment_secret(key):
+            run_command(
+                ["gh", "secret", "set", key, "--env", target_environment, *repo_flag],
+                cwd=config.repo_root,
+                env=subprocess_env,
+                input_data=value,
+            )
+            synced_secrets.append(key)
+            continue
+
+        run_command(
+            ["gh", "variable", "set", key, "--env", target_environment, "--body", value, *repo_flag],
+            cwd=config.repo_root,
+            env=subprocess_env,
+        )
+        synced_variables.append(key)
+
+    print(
+        f"Synced GitHub Environment '{target_environment}'"
+        + (f" in repo '{github_repo.strip()}'" if github_repo and github_repo.strip() else "")
+        + f": {len(synced_variables)} variable(s), {len(synced_secrets)} secret(s)."
+    )
+    if skipped_blank:
+        print("Skipped blank values: " + ", ".join(skipped_blank))
+
+
+def infer_github_repo_from_origin(config: DevConfig) -> str:
+    """Infer the GitHub owner/name slug from the local origin remote."""
+
+    result = run_command(
+        ["git", "config", "--get", "remote.origin.url"],
+        cwd=config.repo_root,
+        capture_output=True,
+    )
+    remote_url = result.stdout.strip()
+    if not remote_url:
+        raise DevCliError("Unable to infer the GitHub repo because remote.origin.url is empty.")
+
+    match = re.search(r"github\.com[:/](?P<slug>[^/\s]+/[^/\s]+?)(?:\.git)?$", remote_url)
+    if not match:
+        raise DevCliError(
+            f"Unable to infer the GitHub repo from remote.origin.url: {remote_url}\n"
+            "Use a GitHub remote URL or update the repo-origin parsing logic."
+        )
+
+    return match.group("slug")
+
+
+def get_github_environment_variables(config: DevConfig, *, repo_slug: str, environment_name: str) -> dict[str, str]:
+    """Return the current GitHub Environment variables for the target environment."""
+
+    path = (
+        f"repos/{repo_slug}/environments/{urllib.parse.quote(environment_name, safe='')}"
+        "/variables?per_page=100"
+    )
+    result = run_command(
+        ["gh", "api", path],
+        cwd=config.repo_root,
+        capture_output=True,
+    )
+    payload = json.loads(result.stdout)
+    variables = payload.get("variables")
+    if not isinstance(variables, list):
+        raise DevCliError(f"Unexpected GitHub Environment variables payload for '{environment_name}'.")
+
+    parsed: dict[str, str] = {}
+    for variable in variables:
+        if not isinstance(variable, dict):
+            continue
+        name = variable.get("name")
+        value = variable.get("value")
+        if isinstance(name, str) and isinstance(value, str):
+            parsed[name] = value
+    return parsed
+
+
+def get_github_environment_secret_names(config: DevConfig, *, repo_slug: str, environment_name: str) -> set[str]:
+    """Return the current GitHub Environment secret names for the target environment."""
+
+    path = (
+        f"repos/{repo_slug}/environments/{urllib.parse.quote(environment_name, safe='')}"
+        "/secrets?per_page=100"
+    )
+    result = run_command(
+        ["gh", "api", path],
+        cwd=config.repo_root,
+        capture_output=True,
+    )
+    payload = json.loads(result.stdout)
+    secrets = payload.get("secrets")
+    if not isinstance(secrets, list):
+        raise DevCliError(f"Unexpected GitHub Environment secrets payload for '{environment_name}'.")
+
+    names: set[str] = set()
+    for secret in secrets:
+        if not isinstance(secret, dict):
+            continue
+        name = secret.get("name")
+        if isinstance(name, str):
+            names.add(name)
+    return names
+
+
+def assert_github_environment_sync(config: DevConfig, *, target: str) -> None:
+    """Ensure the checked-out deploy env file is reflected in the matching GitHub Environment."""
+
+    if target not in {"staging", "production"}:
+        return
+    if os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true":
+        print("Skipping GitHub Environment sync preflight inside GitHub Actions.")
+        return
+
+    assert_command_available("gh")
+    auth_status = run_command(
+        ["gh", "auth", "status"],
+        cwd=config.repo_root,
+        check=False,
+        capture_output=True,
+    )
+    if auth_status.returncode != 0:
+        detail = ((auth_status.stderr or "").strip() or (auth_status.stdout or "").strip()) or "GitHub CLI is not authenticated."
+        raise DevCliError(
+            "GitHub Environment sync preflight requires an authenticated gh session.\n"
+            f"{detail}"
+        )
+
+    env_path = get_environment_file_path(config, target=target)
+    if not env_path.exists():
+        raise DevCliError(f"GitHub Environment sync preflight requires an existing environment file: {env_path}")
+
+    repo_slug = infer_github_repo_from_origin(config)
+    environment_name = target
+    environment_path = f"repos/{repo_slug}/environments/{urllib.parse.quote(environment_name, safe='')}"
+    run_command(["gh", "api", environment_path], cwd=config.repo_root, capture_output=True)
+
+    expected = {
+        key: value.strip()
+        for key, value in parse_env_assignments(env_path.read_text(encoding="utf-8")).items()
+        if value.strip()
+    }
+    expected_variables = {key: value for key, value in expected.items() if not is_github_environment_secret(key)}
+    expected_secrets = {key for key in expected if is_github_environment_secret(key)}
+
+    actual_variables = get_github_environment_variables(config, repo_slug=repo_slug, environment_name=environment_name)
+    actual_secret_names = get_github_environment_secret_names(config, repo_slug=repo_slug, environment_name=environment_name)
+
+    missing_variables = sorted(name for name in expected_variables if name not in actual_variables)
+    mismatched_variables = sorted(name for name, value in expected_variables.items() if actual_variables.get(name) != value)
+    missing_secrets = sorted(name for name in expected_secrets if name not in actual_secret_names)
+
+    if missing_variables or mismatched_variables or missing_secrets:
+        details: list[str] = []
+        if missing_variables:
+            details.append("missing vars: " + ", ".join(missing_variables))
+        if mismatched_variables:
+            details.append("mismatched vars: " + ", ".join(mismatched_variables))
+        if missing_secrets:
+            details.append("missing secrets: " + ", ".join(missing_secrets))
+        raise DevCliError(
+            f"GitHub Environment '{environment_name}' is not synced with {env_path.name}.\n"
+            + "\n".join(details)
+            + f"\nRerun: python ./scripts/dev.py env {target} --sync-github-environment"
+        )
+
+    print(
+        f"GitHub Environment '{environment_name}' matches {env_path.name} for "
+        f"{len(expected_variables)} variable(s) and {len(expected_secrets)} secret name(s)."
+    )
+    if expected_secrets:
+        print("Secret presence was verified by name only; GitHub does not expose secret values for comparison.")
 
 
 def get_api_root(config: DevConfig) -> Path:
@@ -4200,6 +5324,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Open the target environment file in the platform default application",
     )
+    env_command.add_argument(
+        "--sync-github-environment",
+        action="store_true",
+        help="Publish the current target environment file into the matching GitHub Environment",
+    )
+    env_command.add_argument(
+        "--github-environment",
+        help="Override the GitHub Environment name instead of using the target name directly",
+    )
+    env_command.add_argument(
+        "--repo",
+        help="Optional GitHub repo override in owner/name form for gh commands",
+    )
 
     api_login = subparsers.add_parser(
         "api-login",
@@ -4437,26 +5574,63 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
+    deploy = subparsers.add_parser(
+        "deploy",
+        parents=[shared],
+        help="Run the hosted deploy flow, defaulting to production unless --staging is provided",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    deploy.add_argument(
+        "--staging",
+        action="store_true",
+        help="Target the staging environment instead of production",
+    )
+    deploy.add_argument(
+        "--force",
+        action="store_true",
+        help="Rerun every deploy stage from scratch instead of reusing completed-stage state",
+    )
+    deploy.add_argument(
+        "--upgrade",
+        action="store_true",
+        help="Allow a new source fingerprint to replace the saved stage state and rerun the deploy stages",
+    )
+    deploy.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Run only the provider/config preflight checks for the selected environment",
+    )
+    deploy.add_argument(
+        "--dry-run-only",
+        action="store_true",
+        help="Run preflight plus the non-publishing dry-run checks for the selected environment",
+    )
+
     deploy_staging = subparsers.add_parser(
         "deploy-staging",
         parents=[shared],
-        help="Run staging deployment wrappers for Pages and Workers",
+        help=argparse.SUPPRESS,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     deploy_staging.add_argument(
-        "--pages-only",
+        "--force",
         action="store_true",
-        help="Deploy only the Cloudflare Pages bundle",
+        help=argparse.SUPPRESS,
     )
     deploy_staging.add_argument(
-        "--workers-only",
+        "--upgrade",
         action="store_true",
-        help="Deploy only the Cloudflare Workers bundle",
+        help=argparse.SUPPRESS,
     )
     deploy_staging.add_argument(
-        "--dry-run",
+        "--preflight-only",
         action="store_true",
-        help="Build and validate deployment inputs without publishing them",
+        help=argparse.SUPPRESS,
+    )
+    deploy_staging.add_argument(
+        "--dry-run-only",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
 
     return parser
@@ -4534,7 +5708,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     repo_root = get_repo_root(Path(__file__))
     config = config_from_args(args, repo_root)
-    auto_load_command_environment(config, command_name=args.command)
+    deploy_target = None
+    if args.command == "deploy":
+        deploy_target = resolve_deploy_target(staging=getattr(args, "staging", False))
+    elif args.command == "deploy-staging":
+        deploy_target = "staging"
+    auto_load_command_environment(config, command_name=args.command, deploy_target=deploy_target)
     config = apply_runtime_base_url_overrides(config)
 
     try:
@@ -4612,6 +5791,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 target=args.target,
                 copy_example=args.copy_example,
                 open_file=args.open,
+                sync_github_environment=args.sync_github_environment,
+                github_environment=args.github_environment,
+                github_repo=args.repo,
             )
         elif args.command == "api-login":
             login_postman_cli(config, postman_api_key=args.postman_api_key)
@@ -4679,12 +5861,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config,
                 update_snapshots=True,
             )
-        elif args.command == "deploy-staging":
-            deploy_migration_staging(
+        elif args.command == "deploy":
+            deploy_migration_target(
                 config,
-                pages_only=args.pages_only,
-                workers_only=args.workers_only,
-                dry_run=args.dry_run,
+                target=resolve_deploy_target(staging=args.staging),
+                force=args.force,
+                upgrade=args.upgrade,
+                preflight_only=args.preflight_only,
+                dry_run_only=args.dry_run_only,
+            )
+        elif args.command == "deploy-staging":
+            deploy_migration_target(
+                config,
+                target="staging",
+                force=args.force,
+                upgrade=args.upgrade,
+                preflight_only=args.preflight_only,
+                dry_run_only=args.dry_run_only,
             )
         else:
             parser.error(f"Unknown command: {args.command}")

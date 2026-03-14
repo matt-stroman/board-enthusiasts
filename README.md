@@ -107,15 +107,29 @@ python ./scripts/dev.py test
 python ./scripts/dev.py contract-smoke --start-workers
 python ./scripts/dev.py workers-smoke --start-stack
 python ./scripts/dev.py parity-test
-python ./scripts/dev.py deploy-staging --dry-run
+python ./scripts/dev.py deploy --staging --dry-run-only
+python ./scripts/dev.py deploy --staging
 python ./scripts/dev.py env staging --copy-example
 python ./scripts/dev.py env staging --open
+python ./scripts/dev.py env staging --sync-github-environment
 ```
+
+GitHub web UI deploys are also supported through the manual workflow:
+
+- `Actions` -> `Manual Deploy`
+- choose `staging` or `production`
+- optionally set `force`, `upgrade`, `preflight_only`, or `dry_run_only`
+- run the workflow after the matching GitHub Environment (`staging` or `production`) has the required vars and secrets configured
+
+Local deploy preflight now also verifies that the matching GitHub Environment is in sync with the checked-out root `.env` file before publish. If the Environment has drifted, rerun:
+
+- `python ./scripts/dev.py env staging --sync-github-environment`
+- `python ./scripts/dev.py env production --sync-github-environment`
 
 The supported root-managed environment files live under [`config/`](config):
 
 - `config/.env.local`: local developer overrides used by the root CLI for local runtime workflows
-- `config/.env.staging`: staging deployment/operator values used by `deploy-staging`
+- `config/.env.staging`: staging deployment/operator values used by `deploy --staging`
 - `config/.env`: reserved for future production deployment/operator values
 
 For hosted Supabase environments, `SUPABASE_URL` may be omitted when `SUPABASE_PROJECT_REF` is set and the project uses the default hosted Supabase URL. Keep `SUPABASE_URL` explicit for local development, custom domains, and any non-default routing.

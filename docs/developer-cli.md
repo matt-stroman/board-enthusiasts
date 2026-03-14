@@ -53,6 +53,7 @@ python ./scripts/dev.py env local --copy-example
 python ./scripts/dev.py env local --open
 python ./scripts/dev.py env staging --copy-example
 python ./scripts/dev.py env staging --open
+python ./scripts/dev.py env staging --sync-github-environment
 ```
 
 The maintained root CLI owns the shared environment-file layout under [`config/`](../config):
@@ -62,6 +63,39 @@ The maintained root CLI owns the shared environment-file layout under [`config/`
 - [`config/.env.example`](../config/.env.example) -> copy to `config/.env` for future production deployment inputs
 
 The live `.env` files are intentionally ignored and must not be committed.
+
+You can also publish the current staging or production env file directly into the matching GitHub Environment:
+
+```bash
+python ./scripts/dev.py env staging --sync-github-environment
+python ./scripts/dev.py env production --sync-github-environment
+```
+
+Useful flags:
+
+- `--github-environment <name>` to override the target GitHub Environment name
+- `--repo <owner/name>` to target a specific repo with `gh`
+
+The sync command uses the same maintained variable/secret split documented for the GitHub Actions deploy workflow:
+
+- public/runtime-safe values become GitHub Environment `vars`
+- server-only values become GitHub Environment `secrets`
+
+Blank values are skipped rather than published.
+
+When you run a local hosted deploy, preflight now also validates that the matching GitHub Environment stays in sync with the checked-out root env file:
+
+- `deploy --staging` checks GitHub Environment `staging` against `config/.env.staging`
+- `deploy` checks GitHub Environment `production` against `config/.env`
+
+Current limitation:
+
+- GitHub exposes Environment variable values and secret names
+- GitHub does not expose secret values back to clients
+- so preflight can prove:
+  - variable values match
+  - required secret names exist
+- but it cannot prove the current secret values still match the local file
 
 ### First-time setup + run
 
@@ -258,25 +292,35 @@ This command runs the Playwright-based parity suite under `tests/parity` against
 python ./scripts/dev.py capture-parity-baseline
 ```
 
-### Run staging deployment wrappers for Pages and Workers
+### Run hosted deploy validation and publish flows
 
 ```bash
-python ./scripts/dev.py deploy-staging --dry-run
-python ./scripts/dev.py deploy-staging --pages-only
-python ./scripts/dev.py deploy-staging --workers-only
+python ./scripts/dev.py deploy --staging --preflight-only
+python ./scripts/dev.py deploy --staging --dry-run-only
+python ./scripts/dev.py deploy --staging
+python ./scripts/dev.py deploy
 ```
 
-`deploy-staging` automatically loads `config/.env.staging` when that file exists. The staging file is the canonical operator-owned input source for staging deploy values such as:
+`deploy` automatically loads the target environment file before running the hosted deploy flow:
 
+- `python ./scripts/dev.py deploy --staging` uses `config/.env.staging`
+- `python ./scripts/dev.py deploy` uses `config/.env`
+
+The environment file is the canonical operator-owned input source for hosted deploy values such as:
+
+- `BOARD_ENTHUSIASTS_SPA_BASE_URL`
 - `BOARD_ENTHUSIASTS_WORKERS_BASE_URL`
 - `SUPABASE_URL`
 - `SUPABASE_PROJECT_REF`
 - `SUPABASE_PUBLISHABLE_KEY`
 - `SUPABASE_SECRET_KEY`
+- `SUPABASE_DB_PASSWORD`
+- `SUPABASE_ACCESS_TOKEN`
 - `VITE_TURNSTILE_SITE_KEY`
 - `TURNSTILE_SECRET_KEY`
 - `BREVO_API_KEY`
 - `BREVO_SIGNUPS_LIST_ID`
+- `DEPLOY_SMOKE_SECRET`
 
 `SUPABASE_URL` remains supported everywhere. When `SUPABASE_URL` is blank and `SUPABASE_PROJECT_REF` is set, the root CLI infers the default hosted URL as `https://<project-ref>.supabase.co`.
 
@@ -287,7 +331,94 @@ Precedence rules:
 - local development should keep an explicit local `SUPABASE_URL`
 - custom domains and vanity subdomains should keep an explicit `SUPABASE_URL`
 
-When `deploy-staging` runs a real Workers deployment, it also syncs the Cloudflare Worker secrets from that same root staging file before deploying the Worker bundle.
+`deploy` always runs the following sequence for the selected target:
+
+1. preflight checks
+2. dry-run validation
+3. resumable transactional deploy stages
+4. post-deploy smoke tests
+
+The transactional stages currently cover:
+
+- hosted Supabase schema migration
+- hosted Supabase bucket provisioning
+- Cloudflare Pages project creation
+- Cloudflare Worker deploy
+- Cloudflare Pages deploy
+
+Completed deploy stages are tracked locally under `.dev-cli-logs/deploy-<target>-state.json`.
+If a later rerun uses the same source fingerprint, the CLI skips already completed stages and reruns the smoke tests.
+
+Use these flags when needed:
+
+- `--force`: rerun every deploy stage from scratch
+- `--upgrade`: replace a saved stage-state fingerprint with the current source fingerprint
+- `--preflight-only`: stop after provider/config validation
+- `--dry-run-only`: stop after preflight plus dry-run validation
+
+When `deploy` runs a real Workers deployment, it also syncs the Cloudflare Worker secrets from that same root environment file before deploying the Worker bundle, including `DEPLOY_SMOKE_SECRET` for the post-deploy signup smoke.
+
+### Run hosted deploys from the GitHub web UI
+
+The root repo also exposes the same deploy workflow through GitHub Actions:
+
+- open `Actions` in GitHub
+- select `Manual Deploy`
+- choose the target environment:
+  - `staging`
+  - `production`
+- optionally enable:
+  - `force`
+  - `upgrade`
+  - `preflight_only`
+  - `dry_run_only`
+
+The workflow writes the matching root environment file on the runner and then calls the maintained CLI:
+
+- `python ./scripts/dev.py deploy --staging` for `staging`
+- `python ./scripts/dev.py deploy` for `production`
+
+The workflow expects GitHub Environment-scoped configuration named exactly like the root `.env` keys. Recommended setup:
+
+- GitHub Environment `staging`
+- GitHub Environment `production`
+
+Typical Environment `vars`:
+
+- `BOARD_ENTHUSIASTS_SPA_BASE_URL`
+- `BOARD_ENTHUSIASTS_WORKERS_BASE_URL`
+- `SUPABASE_PROJECT_REF`
+- `SUPABASE_URL`
+- `SUPABASE_PUBLISHABLE_KEY`
+- `SUPABASE_AVATARS_BUCKET`
+- `SUPABASE_CARD_IMAGES_BUCKET`
+- `SUPABASE_HERO_IMAGES_BUCKET`
+- `SUPABASE_LOGO_IMAGES_BUCKET`
+- `CLOUDFLARE_ACCOUNT_ID`
+- `VITE_TURNSTILE_SITE_KEY`
+- `BREVO_SIGNUPS_LIST_ID`
+- `ALLOWED_WEB_ORIGINS`
+- `SUPPORT_REPORT_RECIPIENT`
+- `SUPPORT_REPORT_SENDER_EMAIL`
+- `SUPPORT_REPORT_SENDER_NAME`
+- `VITE_LANDING_MODE`
+
+Typical Environment `secrets`:
+
+- `SUPABASE_SECRET_KEY`
+- `SUPABASE_DB_PASSWORD`
+- `SUPABASE_ACCESS_TOKEN`
+- `CLOUDFLARE_API_TOKEN`
+- `TURNSTILE_SECRET_KEY`
+- `BREVO_API_KEY`
+- `DEPLOY_SMOKE_SECRET`
+
+Optional future hosted-auth values can also be provided there when needed:
+
+- `SUPABASE_AUTH_GITHUB_CLIENT_ID`
+- `SUPABASE_AUTH_GITHUB_CLIENT_SECRET`
+- `SUPABASE_AUTH_GOOGLE_CLIENT_ID`
+- `SUPABASE_AUTH_GOOGLE_CLIENT_SECRET`
 
 ### Check local tool and environment status
 
@@ -411,7 +542,7 @@ Workflow-specific overrides remain available where they still map to the maintai
 - `workers-smoke --start-stack`
 - `parity-test`
 - `capture-parity-baseline`
-- `deploy-staging --dry-run`
+- `deploy --staging --dry-run-only`
 - `env <local|staging|production> [--copy-example] [--open]`
 
 For live API contract execution, the default environment template is:

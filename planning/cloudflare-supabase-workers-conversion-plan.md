@@ -269,7 +269,7 @@ Expected commands after conversion:
 - `python ./scripts/dev.py test`
 - `python ./scripts/dev.py verify`
 - `python ./scripts/dev.py seed-data`
-- `python ./scripts/dev.py deploy-staging`
+- `python ./scripts/dev.py deploy --staging`
 
 Expected local behavior:
 

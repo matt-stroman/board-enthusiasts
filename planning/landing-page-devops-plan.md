@@ -252,8 +252,8 @@ Current repo state already has:
 
 Recommended next CI/CD additions for this wave:
 
-1. `deploy-staging` on merges to the primary staging branch.
-2. `deploy-production` as an explicitly gated workflow.
+1. `deploy --staging` on merges to the primary staging branch.
+2. `deploy` as an explicitly gated production workflow.
 3. post-deploy smoke checks for:
    - landing page reachable
    - signup endpoint healthy
