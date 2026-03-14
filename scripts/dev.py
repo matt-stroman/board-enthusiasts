@@ -117,7 +117,7 @@ class DevCliError(RuntimeError):
 
 
 REDOCLY_CLI_VERSION = "2.20.3"
-DEFAULT_HTTP_USER_AGENT = "Mozilla/5.0 (compatible; BoardEnthusiastsDevCli/1.0; +https://boardenthusiasts.com)"
+DEPLOY_SMOKE_USER_AGENT = "Mozilla/5.0 (compatible; BoardEnthusiastsDevCli/1.0; +https://boardenthusiasts.com)"
 
 SUPABASE_PROFILE_DATABASE = "database"
 SUPABASE_PROFILE_AUTH = "auth"
@@ -3514,7 +3514,7 @@ def request_json(
     """Issue an HTTP request and parse the JSON response."""
 
     request_data = data
-    merged_headers = {"accept": "application/json", "user-agent": DEFAULT_HTTP_USER_AGENT, **(headers or {})}
+    merged_headers = {"accept": "application/json", **(headers or {})}
     if payload is not None:
         request_data = json.dumps(payload).encode("utf-8")
         merged_headers.setdefault("content-type", "application/json")
@@ -4438,7 +4438,10 @@ def wait_for_workers_deploy_smoke_base_url(*, base_url: str, timeout_seconds: in
     last_error = f"{base_url}/ was not yet reachable."
     while time.time() < deadline:
         try:
-            payload = request_json(url=f"{base_url}/")
+            payload = request_json(
+                url=f"{base_url}/",
+                headers={"accept": "application/json", "user-agent": DEPLOY_SMOKE_USER_AGENT},
+            )
         except DevCliError as ex:
             last_error = str(ex)
         else:
@@ -4464,12 +4467,16 @@ def run_workers_deploy_smoke(config: DevConfig, *, target: str, env_values: dict
         "origin": spa_origin,
         "content-type": "application/json",
         "accept": "application/json",
+        "user-agent": DEPLOY_SMOKE_USER_AGENT,
         "x-board-enthusiasts-deploy-smoke-secret": env_values["DEPLOY_SMOKE_SECRET"],
     }
 
     wait_for_workers_deploy_smoke_base_url(base_url=base_url)
 
-    ready_payload = request_json(url=f"{base_url}/health/ready")
+    ready_payload = request_json(
+        url=f"{base_url}/health/ready",
+        headers={"accept": "application/json", "user-agent": DEPLOY_SMOKE_USER_AGENT},
+    )
     if not isinstance(ready_payload, dict) or ready_payload.get("status") != "ready":
         raise DevCliError("Workers smoke failed: /health/ready did not report ready status.")
 
@@ -4538,7 +4545,7 @@ def run_pages_deploy_smoke(env_values: dict[str, str]) -> None:
     last_error = "Pages custom domain did not become reachable."
     request = urllib.request.Request(
         env_values["BOARD_ENTHUSIASTS_SPA_BASE_URL"],
-        headers={"accept": "text/html", "user-agent": DEFAULT_HTTP_USER_AGENT},
+        headers={"accept": "text/html", "user-agent": DEPLOY_SMOKE_USER_AGENT},
     )
 
     while time.time() < deadline:

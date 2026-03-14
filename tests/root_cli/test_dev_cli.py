@@ -679,7 +679,7 @@ class DevCliMigrationHelperTests(unittest.TestCase):
             requested_urls,
         )
 
-    def test_request_json_sends_default_user_agent_header(self) -> None:
+    def test_request_json_does_not_force_browser_user_agent(self) -> None:
         captured_user_agent: str | None = None
 
         class _Response:
@@ -701,7 +701,7 @@ class DevCliMigrationHelperTests(unittest.TestCase):
             payload = dev.request_json(url="https://example.com/api")
 
         self.assertEqual({"ok": True}, payload)
-        self.assertEqual(dev.DEFAULT_HTTP_USER_AGENT, captured_user_agent)
+        self.assertIsNone(captured_user_agent)
 
     def test_build_supabase_profile_start_command_matches_supported_profiles(self) -> None:
         prefix = ["npx", "supabase"]
