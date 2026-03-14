@@ -3589,6 +3589,43 @@ def get_cloudflare_pages_projects(config: DevConfig, *, env: dict[str, str]) -> 
     return [entry for entry in payload if isinstance(entry, dict)]
 
 
+def get_cloudflare_pages_project(env_values: dict[str, str], *, project_name: str) -> dict[str, object] | None:
+    """Return a Cloudflare Pages project by name when it exists."""
+
+    try:
+        payload = request_json(
+            url=(
+                "https://api.cloudflare.com/client/v4/accounts/"
+                f"{urllib.parse.quote(env_values['CLOUDFLARE_ACCOUNT_ID'])}/pages/projects/"
+                f"{urllib.parse.quote(project_name)}"
+            ),
+            headers=build_cloudflare_api_headers(env_values),
+        )
+    except DevCliError as ex:
+        if "HTTP 404" in str(ex):
+            return None
+        raise DevCliError(
+            "Cloudflare Pages project lookup failed. "
+            "Ensure the API token includes Pages read access for the configured account.\n"
+            f"Original error: {ex}"
+        ) from ex
+
+    if not isinstance(payload, dict):
+        raise DevCliError(f"Cloudflare Pages project lookup for '{project_name}' returned an unexpected payload.")
+
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        raise DevCliError(f"Cloudflare Pages project lookup for '{project_name}' did not include a project result.")
+    return result
+
+
+def is_cloudflare_pages_project_already_exists_error(error: DevCliError) -> bool:
+    """Return whether a Cloudflare Pages project create request failed because the project already exists."""
+
+    message = str(error).lower()
+    return "already exists" in message or "code\":8000002" in message or "code: 8000002" in message
+
+
 def get_pages_custom_domain_hostname(*, spa_base_url: str) -> str | None:
     """Return the Pages custom-domain hostname when the deploy target is not pages.dev."""
 
@@ -3865,25 +3902,27 @@ def ensure_cloudflare_pages_project(config: DevConfig, *, target: str, env: dict
     """Ensure the Cloudflare Pages project exists for the target environment."""
 
     project_name = get_deploy_pages_project_name(target=target)
-    projects = get_cloudflare_pages_projects(config, env=env)
-    if any(project.get("name") == project_name for project in projects):
+    if get_cloudflare_pages_project(env, project_name=project_name) is not None:
         return
 
     write_step(f"Creating Cloudflare Pages project {project_name}")
-    run_command(
-        [
-            "npx",
-            "wrangler",
-            "pages",
-            "project",
-            "create",
-            project_name,
-            "--production-branch",
-            "main",
-        ],
-        cwd=config.repo_root,
-        env=env,
-    )
+    try:
+        request_json(
+            url=(
+                "https://api.cloudflare.com/client/v4/accounts/"
+                f"{urllib.parse.quote(env['CLOUDFLARE_ACCOUNT_ID'])}/pages/projects"
+            ),
+            method="POST",
+            headers=build_cloudflare_api_headers(env),
+            payload={
+                "name": project_name,
+                "production_branch": "main",
+            },
+        )
+    except DevCliError as ex:
+        if is_cloudflare_pages_project_already_exists_error(ex):
+            return
+        raise
 
 
 def assert_pages_custom_domain_prerequisites(env_values: dict[str, str]) -> None:

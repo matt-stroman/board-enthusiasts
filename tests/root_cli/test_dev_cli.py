@@ -450,6 +450,44 @@ class DevCliMigrationHelperTests(unittest.TestCase):
             payload={"name": "staging.boardenthusiasts.com"},
         )
 
+    def test_ensure_cloudflare_pages_project_skips_creation_when_project_exists(self) -> None:
+        config = dev.config_from_args(self.create_args(), pathlib.Path.cwd())
+        env_values = {
+            "CLOUDFLARE_ACCOUNT_ID": "account-id",
+            "CLOUDFLARE_API_TOKEN": "token",
+        }
+
+        with mock.patch.object(
+            dev,
+            "get_cloudflare_pages_project",
+            return_value={"name": "board-enthusiasts-staging"},
+        ) as get_project, mock.patch.object(dev, "request_json") as request_json:
+            dev.ensure_cloudflare_pages_project(config, target="staging", env=env_values)
+
+        get_project.assert_called_once_with(env_values, project_name="board-enthusiasts-staging")
+        request_json.assert_not_called()
+
+    def test_ensure_cloudflare_pages_project_treats_already_exists_as_success(self) -> None:
+        config = dev.config_from_args(self.create_args(), pathlib.Path.cwd())
+        env_values = {
+            "CLOUDFLARE_ACCOUNT_ID": "account-id",
+            "CLOUDFLARE_API_TOKEN": "token",
+        }
+
+        with mock.patch.object(
+            dev,
+            "get_cloudflare_pages_project",
+            return_value=None,
+        ), mock.patch.object(
+            dev,
+            "request_json",
+            side_effect=dev.DevCliError(
+                "HTTP 409 Conflict for https://api.cloudflare.com/client/v4/accounts/account-id/pages/projects: "
+                "{\"success\":false,\"errors\":[{\"code\":8000002,\"message\":\"A project with this name already exists. Choose a different project name.\"}]}"
+            ),
+        ):
+            dev.ensure_cloudflare_pages_project(config, target="staging", env=env_values)
+
     def test_sync_cloudflare_pages_domain_dns_updates_existing_record_target(self) -> None:
         env_values = {
             "BOARD_ENTHUSIASTS_SPA_BASE_URL": "https://staging.boardenthusiasts.com",
