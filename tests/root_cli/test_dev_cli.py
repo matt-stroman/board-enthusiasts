@@ -498,7 +498,7 @@ class DevCliMigrationHelperTests(unittest.TestCase):
         with mock.patch.object(
             dev,
             "get_cloudflare_zone_for_hostname",
-            return_value={"id": "zone-id"},
+            return_value={"id": "zone-id", "name": "staging.boardenthusiasts.com"},
         ), mock.patch.object(
             dev,
             "get_cloudflare_dns_records",
@@ -544,7 +544,7 @@ class DevCliMigrationHelperTests(unittest.TestCase):
         with mock.patch.object(
             dev,
             "get_cloudflare_zone_for_hostname",
-            return_value={"id": "zone-id"},
+            return_value={"id": "zone-id", "name": "boardenthusiasts.com"},
         ), mock.patch.object(
             dev,
             "get_cloudflare_dns_records",
@@ -554,6 +554,57 @@ class DevCliMigrationHelperTests(unittest.TestCase):
                 dev.assert_pages_custom_domain_prerequisites(env_values)
 
         self.assertIn("proxied CNAME target", str(raised.exception))
+
+    def test_assert_pages_custom_domain_prerequisites_allows_apex_cloudflare_managed_routing_records(self) -> None:
+        env_values = {
+            "BOARD_ENTHUSIASTS_SPA_BASE_URL": "https://boardenthusiasts.com",
+            "CLOUDFLARE_ACCOUNT_ID": "account-id",
+            "CLOUDFLARE_API_TOKEN": "token",
+        }
+
+        with mock.patch.object(
+            dev,
+            "get_cloudflare_zone_for_hostname",
+            return_value={"id": "zone-id", "name": "boardenthusiasts.com"},
+        ), mock.patch.object(
+            dev,
+            "get_cloudflare_dns_records",
+            return_value=[
+                {"id": "a1", "type": "A", "name": "boardenthusiasts.com", "proxied": True},
+                {"id": "a2", "type": "A", "name": "boardenthusiasts.com", "proxied": True},
+                {"id": "mx1", "type": "MX", "name": "boardenthusiasts.com"},
+                {"id": "txt1", "type": "TXT", "name": "boardenthusiasts.com"},
+            ],
+        ):
+            dev.assert_pages_custom_domain_prerequisites(env_values)
+
+    def test_sync_cloudflare_pages_domain_dns_skips_apex_cloudflare_managed_routing_records(self) -> None:
+        env_values = {
+            "BOARD_ENTHUSIASTS_SPA_BASE_URL": "https://boardenthusiasts.com",
+            "CLOUDFLARE_ACCOUNT_ID": "account-id",
+            "CLOUDFLARE_API_TOKEN": "token",
+        }
+
+        with mock.patch.object(
+            dev,
+            "get_cloudflare_zone_for_hostname",
+            return_value={"id": "zone-id", "name": "boardenthusiasts.com"},
+        ), mock.patch.object(
+            dev,
+            "get_cloudflare_dns_records",
+            return_value=[
+                {"id": "a1", "type": "A", "name": "boardenthusiasts.com", "proxied": True},
+                {"id": "a2", "type": "A", "name": "boardenthusiasts.com", "proxied": True},
+                {"id": "mx1", "type": "MX", "name": "boardenthusiasts.com"},
+            ],
+        ), mock.patch.object(dev, "request_json") as request_json:
+            dev.sync_cloudflare_pages_domain_dns(
+                env_values,
+                target="production",
+                source_branch="production/1.0.0-landing-page.0",
+            )
+
+        request_json.assert_not_called()
 
     def test_assert_worker_custom_domain_dns_prerequisites_skips_existing_live_custom_domain(self) -> None:
         env_values = {
