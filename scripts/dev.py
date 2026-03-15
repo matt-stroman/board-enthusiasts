@@ -118,6 +118,7 @@ class DevCliError(RuntimeError):
 
 REDOCLY_CLI_VERSION = "2.20.3"
 DEPLOY_SMOKE_USER_AGENT = "Mozilla/5.0 (compatible; BoardEnthusiastsDevCli/1.0; +https://boardenthusiasts.com)"
+ROUTING_DNS_RECORD_TYPES = {"A", "AAAA", "CNAME"}
 
 SUPABASE_PROFILE_DATABASE = "database"
 SUPABASE_PROFILE_AUTH = "auth"
@@ -3748,6 +3749,33 @@ def get_cloudflare_dns_records(env_values: dict[str, str], *, zone_id: str, host
     return extract_cloudflare_result_list(payload, context=f"DNS lookup for {hostname}")
 
 
+def get_routing_dns_records(records: list[dict[str, object]], *, hostname: str) -> list[dict[str, object]]:
+    """Return only address-routing DNS records for an exact hostname."""
+
+    normalized_hostname = hostname.strip().lower()
+    return [
+        record
+        for record in records
+        if str(record.get("name", "")).strip().lower() == normalized_hostname
+        and str(record.get("type", "")).strip().upper() in ROUTING_DNS_RECORD_TYPES
+    ]
+
+
+def is_cloudflare_managed_apex_pages_record(record: dict[str, object], *, hostname: str, zone_name: str) -> bool:
+    """Return whether a record looks like the expected Cloudflare-managed apex Pages routing record."""
+
+    normalized_hostname = hostname.strip().lower()
+    normalized_zone_name = zone_name.strip().lower()
+    if normalized_hostname != normalized_zone_name:
+        return False
+
+    record_type = str(record.get("type", "")).strip().upper()
+    if record_type not in {"A", "AAAA"}:
+        return False
+
+    return bool(record.get("proxied", False))
+
+
 def assert_worker_custom_domain_dns_prerequisites(env_values: dict[str, str]) -> None:
     """Fail early when a Worker custom-domain hostname is blocked by an existing DNS record."""
 
@@ -3859,13 +3887,18 @@ def sync_cloudflare_pages_domain_dns(
     if not zone_id:
         raise DevCliError(f"Cloudflare zone lookup for '{hostname}' did not include an id.")
 
-    records = [
-        record
-        for record in get_cloudflare_dns_records(env_values, zone_id=zone_id, hostname=hostname)
-        if str(record.get("name", "")).strip().lower() == hostname
-    ]
+    zone_name = str(zone.get("name", "")).strip()
+    if not zone_name:
+        raise DevCliError(f"Cloudflare zone lookup for '{hostname}' did not include a name.")
+
+    records = get_routing_dns_records(
+        get_cloudflare_dns_records(env_values, zone_id=zone_id, hostname=hostname),
+        hostname=hostname,
+    )
 
     if len(records) > 1:
+        if all(is_cloudflare_managed_apex_pages_record(record, hostname=hostname, zone_name=zone_name) for record in records):
+            return
         raise DevCliError(
             f"Cloudflare DNS has multiple records for '{hostname}'. Clean up the duplicate records before deploying again."
         )
@@ -3873,6 +3906,8 @@ def sync_cloudflare_pages_domain_dns(
     if records:
         record = records[0]
         record_type = str(record.get("type", "")).strip().upper()
+        if is_cloudflare_managed_apex_pages_record(record, hostname=hostname, zone_name=zone_name):
+            return
         if record_type != "CNAME":
             raise DevCliError(
                 f"Cloudflare DNS record '{hostname}' is type {record_type}, but Pages custom domains require a CNAME target. "
@@ -3946,18 +3981,24 @@ def assert_pages_custom_domain_prerequisites(env_values: dict[str, str]) -> None
     zone_id = str(zone.get("id", "")).strip()
     if not zone_id:
         raise DevCliError(f"Cloudflare zone lookup for '{hostname}' did not include an id.")
-    records = [
-        record
-        for record in get_cloudflare_dns_records(env_values, zone_id=zone_id, hostname=hostname)
-        if str(record.get("name", "")).strip().lower() == hostname
-    ]
+    zone_name = str(zone.get("name", "")).strip()
+    if not zone_name:
+        raise DevCliError(f"Cloudflare zone lookup for '{hostname}' did not include a name.")
+    records = get_routing_dns_records(
+        get_cloudflare_dns_records(env_values, zone_id=zone_id, hostname=hostname),
+        hostname=hostname,
+    )
     if len(records) > 1:
+        if all(is_cloudflare_managed_apex_pages_record(record, hostname=hostname, zone_name=zone_name) for record in records):
+            return
         raise DevCliError(
             f"Cloudflare DNS has multiple records for Pages custom domain '{hostname}'. "
             "Leave at most one record for this hostname before deploying."
         )
     if records:
         record_type = str(records[0].get("type", "")).strip().upper()
+        if is_cloudflare_managed_apex_pages_record(records[0], hostname=hostname, zone_name=zone_name):
+            return
         if record_type != "CNAME":
             raise DevCliError(
                 f"Cloudflare DNS record '{hostname}' is type {record_type}, but the deploy flow manages Pages custom domains "
